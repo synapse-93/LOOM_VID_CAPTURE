@@ -193,12 +193,24 @@ export async function loadMeshBundle(files: File[]): Promise<LoadedMeshResult> {
           const geom = loadGeometryFromBuffer(match.file.name, match.buffer);
           layer.geometry = geom;
 
+          const colorAttr = geom.getAttribute('color');
+          let hasValidColors = false;
+          if (colorAttr && colorAttr.count > 0) {
+            for (let i = 0; i < Math.min(colorAttr.count, 50); i++) {
+              if (colorAttr.getX(i) > 0 || colorAttr.getY(i) > 0 || colorAttr.getZ(i) > 0) {
+                hasValidColors = true;
+                break;
+              }
+            }
+          }
+
           const material = new THREE.MeshStandardMaterial({
-            color: 0xECEEF2,
-            roughness: 0.35,
-            metalness: 0.12,
+            color: 0xd8dde6,
+            roughness: 0.45,
+            metalness: 0.08,
             side: THREE.DoubleSide,
-            vertexColors: !!geom.getAttribute('color'),
+            flatShading: false,
+            vertexColors: hasValidColors,
           });
 
           const mesh = new THREE.Mesh(geom, material);
@@ -252,12 +264,24 @@ export async function loadMeshBundle(files: File[]): Promise<LoadedMeshResult> {
     const group = new THREE.Group();
     group.name = modelFile.name;
 
+    const colorAttr = geom.getAttribute('color');
+    let hasValidColors = false;
+    if (colorAttr && colorAttr.count > 0) {
+      for (let i = 0; i < Math.min(colorAttr.count, 50); i++) {
+        if (colorAttr.getX(i) > 0 || colorAttr.getY(i) > 0 || colorAttr.getZ(i) > 0) {
+          hasValidColors = true;
+          break;
+        }
+      }
+    }
+
     const material = new THREE.MeshStandardMaterial({
-      color: 0xECEEF2,
-      roughness: 0.35,
-      metalness: 0.12,
+      color: 0xd8dde6,
+      roughness: 0.45,
+      metalness: 0.08,
       side: THREE.DoubleSide,
-      vertexColors: !!geom.getAttribute('color'),
+      flatShading: false,
+      vertexColors: hasValidColors,
     });
 
     const mesh = new THREE.Mesh(geom, material);
@@ -340,6 +364,12 @@ export function createBottleSampleMesh(targetHeightMm = 240): THREE.BufferGeomet
   const center = new THREE.Vector3();
   updatedBbox.getCenter(center);
   raw.translate(-center.x, -updatedBbox.min.y, -center.z);
+
+  // Rotate to CAD Z-up coordinates (Z = 0.000 mm baseplate, vertical height along Z)
+  raw.rotateX(Math.PI / 2);
+  raw.computeBoundingBox();
+  const zBbox = raw.boundingBox!;
+  raw.translate(0, 0, -zBbox.min.z);
   raw.computeVertexNormals();
 
   return raw;

@@ -20,6 +20,7 @@ export const StlInspector: React.FC = () => {
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
+  const currentGroupRef = useRef<THREE.Group | null>(null);
   const currentMeshRef = useRef<THREE.Mesh | null>(null);
   const currentGeomRef = useRef<THREE.BufferGeometry | null>(null);
 
@@ -33,77 +34,133 @@ export const StlInspector: React.FC = () => {
     triangles: 0,
   });
 
-  // Calculate Bounding Dimensions and Triangle Count
-  const updateTelemetry = (geom: THREE.BufferGeometry) => {
-    geom.computeBoundingBox();
-    const bbox = geom.boundingBox || new THREE.Box3();
-    const size = new THREE.Vector3();
-    bbox.getSize(size);
-
+  // Calculate Bounding Dimensions and Triangle Count from world size
+  const updateTelemetry = (geom: THREE.BufferGeometry, worldSize?: THREE.Vector3) => {
     const pos = geom.getAttribute('position');
-    const triangles = geom.index ? geom.index.count / 3 : pos.count / 3;
+    const triangles = geom.index ? geom.index.count / 3 : pos ? pos.count / 3 : 0;
 
-    setTelemetry({
-      dimX: Math.round(size.x * 10) / 10,
-      dimY: Math.round(size.z * 10) / 10, // Depth
-      dimZ: Math.round(size.y * 10) / 10, // Height
-      triangles: Math.round(triangles),
-    });
+    if (worldSize) {
+      setTelemetry({
+        dimX: Math.round(worldSize.x * 10) / 10,
+        dimY: Math.round(worldSize.z * 10) / 10, // Width / Depth in XZ plane
+        dimZ: Math.round(worldSize.y * 10) / 10, // Height along Y
+        triangles: Math.round(triangles),
+      });
+    } else {
+      geom.computeBoundingBox();
+      const bbox = geom.boundingBox || new THREE.Box3();
+      const size = new THREE.Vector3();
+      bbox.getSize(size);
+
+      setTelemetry({
+        dimX: Math.round(size.x * 10) / 10,
+        dimY: Math.round(size.y * 10) / 10,
+        dimZ: Math.round(size.z * 10) / 10,
+        triangles: Math.round(triangles),
+      });
+    }
   };
 
-  // Center on X/Y and snap lowest vertex flush to Z = 0.000 mm on millimeter GridHelper
+  // Center on X/Z and snap lowest vertex flush to Y = 0.000 mm on millimeter GridHelper
   const loadGeometry = useCallback((geometry: THREE.BufferGeometry) => {
     if (!sceneRef.current || !cameraRef.current || !controlsRef.current) return;
 
     currentGeomRef.current = geometry;
-    geometry.computeBoundingBox();
-    const bbox = geometry.boundingBox!;
-    const center = new THREE.Vector3();
-    bbox.getCenter(center);
-
-    // Auto-center on X/Z and snap lowest vertex flush to Y = 0.000 (Z_min = 0.000 mm)
-    geometry.translate(-center.x, -bbox.min.y, -center.z);
     geometry.computeVertexNormals();
 
-    if (currentMeshRef.current) {
-      sceneRef.current.remove(currentMeshRef.current);
-      currentMeshRef.current.geometry.dispose();
-      (currentMeshRef.current.material as THREE.Material).dispose();
+    // Check if geometry contains valid non-zero vertex colors
+    const colorAttr = geometry.getAttribute('color');
+    let hasValidColors = false;
+    if (colorAttr && colorAttr.count > 0) {
+      for (let i = 0; i < Math.min(colorAttr.count, 50); i++) {
+        if (colorAttr.getX(i) > 0 || colorAttr.getY(i) > 0 || colorAttr.getZ(i) > 0) {
+          hasValidColors = true;
+          break;
+        }
+      }
+    }
+
+    // Clean up previous mesh group
+    if (currentGroupRef.current) {
+      sceneRef.current.remove(currentGroupRef.current);
+      currentGroupRef.current.traverse((child) => {
+        if ((child as THREE.Mesh).isMesh) {
+          const m = child as THREE.Mesh;
+          m.geometry?.dispose();
+          if (Array.isArray(m.material)) {
+            m.material.forEach((mat) => mat.dispose());
+          } else {
+            m.material?.dispose();
+          }
+        }
+      });
+      currentGroupRef.current = null;
       currentMeshRef.current = null;
     }
 
-    // Industrial matte CAD material
+    // High-Contrast CAD Clay Material
     const material = new THREE.MeshStandardMaterial({
-      color: 0xECEEF2,
-      roughness: 0.38,
-      metalness: 0.15,
-      wireframe: isWireframe,
+      color: 0xd8dde6,
+      roughness: 0.45,
+      metalness: 0.08,
       side: THREE.DoubleSide,
+      flatShading: false,
+      wireframe: isWireframe,
+      vertexColors: hasValidColors,
     });
 
     const mesh = new THREE.Mesh(geometry, material);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
-    sceneRef.current.add(mesh);
     currentMeshRef.current = mesh;
 
-    updateTelemetry(geometry);
+    // Create group and apply CAD Z-up to Three.js Y-up coordinate rotation
+    const group = new THREE.Group();
+    group.rotation.x = -Math.PI / 2;
+    group.add(mesh);
+    sceneRef.current.add(group);
+    currentGroupRef.current = group;
 
-    // Auto-frame camera with bounding sphere
-    geometry.computeBoundingSphere();
-    const sphere = geometry.boundingSphere!;
-    const radius = Math.max(30, sphere.radius);
-    cameraRef.current.position.set(radius * 2.0, radius * 1.6, radius * 2.2);
-    controlsRef.current.target.set(0, radius * 0.4, 0);
-    controlsRef.current.update();
+    // Compute exact world bounding box after rotation
+    group.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(group);
+    const rawCenter = box.getCenter(new THREE.Vector3());
+
+    // Translate so X and Z center sit at (0, 0) and lowest vertex sits flush at Y = 0.000 mm
+    group.position.x = -rawCenter.x;
+    group.position.y = -box.min.y;
+    group.position.z = -rawCenter.z;
+    group.updateMatrixWorld(true);
+
+    // Recompute box after centering
+    box.setFromObject(group);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z, 20);
+
+    updateTelemetry(geometry, size);
+
+    // Frame camera with world bounding dimensions
+    const camera = cameraRef.current;
+    const controls = controlsRef.current;
+    controls.target.copy(center);
+    camera.position.set(
+      center.x + maxDim * 1.4,
+      center.y + maxDim * 1.1,
+      center.z + maxDim * 1.4
+    );
+    camera.near = maxDim * 0.001;
+    camera.far = maxDim * 50;
+    camera.updateProjectionMatrix();
+    controls.update();
   }, [isWireframe]);
 
   // Initialize Three.js WebGL Viewport
   useEffect(() => {
     if (!mountRef.current) return;
     const container = mountRef.current;
-    const width = container.clientWidth;
-    const height = container.clientHeight;
+    const width = container.clientWidth || 800;
+    const height = container.clientHeight || 600;
 
     // Scene
     const scene = new THREE.Scene();
@@ -111,7 +168,7 @@ export const StlInspector: React.FC = () => {
     sceneRef.current = scene;
 
     // Camera
-    const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 2000);
+    const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 5000);
     cameraRef.current = camera;
 
     // Renderer (zero glow, matte anti-aliasing)
@@ -119,6 +176,7 @@ export const StlInspector: React.FC = () => {
     renderer.setSize(width, height);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
@@ -126,38 +184,49 @@ export const StlInspector: React.FC = () => {
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.05;
+    controls.maxDistance = 5000;
+    controls.minDistance = 2;
     controlsRef.current = controls;
 
-    // Millimeter GridHelper (10 mm divisions, major lines every 50 mm, at Z = 0.000 mm flush)
-    const gridHelper = new THREE.GridHelper(200, 20, 0x363B45, 0x1A1D21);
+    // Millimeter GridHelper at Y = 0.000 mm flush
+    const gridHelper = new THREE.GridHelper(300, 30, 0x262930, 0x1A1D21);
     gridHelper.position.y = 0;
     scene.add(gridHelper);
 
-    // Directional Studio Lighting
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.55);
-    scene.add(ambientLight);
+    // Strong Scene Lighting: Hemisphere + 3 Directional Lights
+    const hemiLight = new THREE.HemisphereLight(0xffffff, 0x262930, 1.3);
+    scene.add(hemiLight);
 
-    const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.1);
-    dirLight1.position.set(120, 160, 100);
-    dirLight1.castShadow = true;
-    scene.add(dirLight1);
+    // Key light at (200, 400, 300) intensity 1.8
+    const keyLight = new THREE.DirectionalLight(0xffffff, 1.8);
+    keyLight.position.set(200, 400, 300);
+    keyLight.castShadow = true;
+    scene.add(keyLight);
 
-    const dirLight2 = new THREE.DirectionalLight(0x8A909E, 0.45);
-    dirLight2.position.set(-100, 60, -100);
-    scene.add(dirLight2);
+    // Rim light at (-250, 200, -200) intensity 1.0
+    const rimLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    rimLight.position.set(-250, 200, -200);
+    scene.add(rimLight);
+
+    // Bottom fill at (0, -200, 100) intensity 0.5
+    const bottomFill = new THREE.DirectionalLight(0xffffff, 0.5);
+    bottomFill.position.set(0, -200, 100);
+    scene.add(bottomFill);
 
     // Load Default Calibration Prism Gauge Mesh
     const defaultGeom = createCalibrationPrismGeometry();
     loadGeometry(defaultGeom);
 
-    // Resize observer
-    const resizeObserver = new ResizeObserver(() => {
-      if (!container || !renderer || !camera) return;
-      const w = container.clientWidth;
-      const h = container.clientHeight;
-      camera.aspect = w / h;
-      camera.updateProjectionMatrix();
-      renderer.setSize(w, h);
+    // ResizeObserver for automatic WebGL canvas resizing
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width: w, height: h } = entry.contentRect;
+        if (w > 0 && h > 0 && rendererRef.current && cameraRef.current) {
+          cameraRef.current.aspect = w / h;
+          cameraRef.current.updateProjectionMatrix();
+          rendererRef.current.setSize(w, h);
+        }
+      }
     });
     resizeObserver.observe(container);
 
@@ -172,6 +241,7 @@ export const StlInspector: React.FC = () => {
     return () => {
       cancelAnimationFrame(animId);
       resizeObserver.disconnect();
+      controls.dispose();
       renderer.dispose();
       if (container.contains(renderer.domElement)) {
         container.removeChild(renderer.domElement);
@@ -188,12 +258,21 @@ export const StlInspector: React.FC = () => {
 
   // Reset Camera View
   const handleResetCamera = () => {
-    if (!currentGeomRef.current || !cameraRef.current || !controlsRef.current) return;
-    currentGeomRef.current.computeBoundingSphere();
-    const sphere = currentGeomRef.current.boundingSphere!;
-    const radius = Math.max(30, sphere.radius);
-    cameraRef.current.position.set(radius * 2.0, radius * 1.6, radius * 2.2);
-    controlsRef.current.target.set(0, radius * 0.4, 0);
+    if (!currentGroupRef.current || !cameraRef.current || !controlsRef.current) return;
+    const box = new THREE.Box3().setFromObject(currentGroupRef.current);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z, 20);
+
+    controlsRef.current.target.copy(center);
+    cameraRef.current.position.set(
+      center.x + maxDim * 1.4,
+      center.y + maxDim * 1.1,
+      center.z + maxDim * 1.4
+    );
+    cameraRef.current.near = maxDim * 0.001;
+    cameraRef.current.far = maxDim * 50;
+    cameraRef.current.updateProjectionMatrix();
     controlsRef.current.update();
   };
 

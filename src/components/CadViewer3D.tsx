@@ -67,7 +67,12 @@ export const CadViewer3D: React.FC<CadViewer3DProps> = ({
     camera.position.set(160, 140, 200);
     cameraRef.current = camera;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
+    const renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      alpha: false,
+      powerPreference: 'high-performance',
+      preserveDrawingBuffer: true,
+    });
     renderer.setSize(width, height);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.shadowMap.enabled = true;
@@ -80,26 +85,29 @@ export const CadViewer3D: React.FC<CadViewer3DProps> = ({
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.05;
-    controls.maxDistance = 3000;
-    controls.minDistance = 5;
+    controls.maxDistance = 5000;
+    controls.minDistance = 2;
     controlsRef.current = controls;
 
-    // 3-Point Studio + Hemisphere Lighting
-    const hemiLight = new THREE.HemisphereLight(0xECEEF2, 0x0C0D0F, 0.75);
+    // Strong Scene Lighting: Hemisphere + 3 Directional Lights
+    const hemiLight = new THREE.HemisphereLight(0xffffff, 0x262930, 1.3);
     scene.add(hemiLight);
 
-    const keyLight = new THREE.DirectionalLight(0xFFFFFF, 1.3);
-    keyLight.position.set(200, 300, 200);
+    // Key light at (200, 400, 300) intensity 1.8
+    const keyLight = new THREE.DirectionalLight(0xffffff, 1.8);
+    keyLight.position.set(200, 400, 300);
     keyLight.castShadow = true;
     scene.add(keyLight);
 
-    const fillLight = new THREE.DirectionalLight(0x8A909E, 0.5);
-    fillLight.position.set(-200, 100, -200);
-    scene.add(fillLight);
-
-    const rimLight = new THREE.DirectionalLight(0xECEEF2, 0.85);
-    rimLight.position.set(0, 250, -300);
+    // Rim light at (-250, 200, -200) intensity 1.0
+    const rimLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    rimLight.position.set(-250, 200, -200);
     scene.add(rimLight);
+
+    // Bottom fill at (0, -200, 100) intensity 0.5
+    const bottomFill = new THREE.DirectionalLight(0xffffff, 0.5);
+    bottomFill.position.set(0, -200, 100);
+    scene.add(bottomFill);
 
     // Formlabs-style precision build-plate millimeter grid at Y = 0.000 mm
     const grid = new THREE.GridHelper(300, 30, 0x262930, 0x1A1D21);
@@ -111,6 +119,19 @@ export const CadViewer3D: React.FC<CadViewer3DProps> = ({
     const clipPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), 1000);
     clipPlaneRef.current = clipPlane;
 
+    // ResizeObserver for automatic WebGL canvas resizing
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width: w, height: h } = entry.contentRect;
+        if (w > 0 && h > 0 && rendererRef.current && cameraRef.current) {
+          cameraRef.current.aspect = w / h;
+          cameraRef.current.updateProjectionMatrix();
+          rendererRef.current.setSize(w, h);
+        }
+      }
+    });
+    resizeObserver.observe(container);
+
     // Animation Render Loop
     let animId: number;
     const animate = () => {
@@ -120,20 +141,9 @@ export const CadViewer3D: React.FC<CadViewer3DProps> = ({
     };
     animate();
 
-    const handleResize = () => {
-      if (!mountRef.current || !rendererRef.current || !cameraRef.current) return;
-      const w = mountRef.current.clientWidth;
-      const h = mountRef.current.clientHeight;
-      cameraRef.current.aspect = w / h;
-      cameraRef.current.updateProjectionMatrix();
-      rendererRef.current.setSize(w, h);
-    };
-
-    window.addEventListener('resize', handleResize);
-
     return () => {
-      window.removeEventListener('resize', handleResize);
       cancelAnimationFrame(animId);
+      resizeObserver.disconnect();
       controls.dispose();
       renderer.dispose();
       if (container.contains(renderer.domElement)) {
@@ -155,7 +165,58 @@ export const CadViewer3D: React.FC<CadViewer3DProps> = ({
     }
   }, [clipEnabled, clipPercent, modelBounds]);
 
-  // Apply Render Mode Material (SOLID / WIREFRAME / XRAY)
+  // Helper to build CAD clay material
+  const buildMaterial = useCallback(
+    (geom: THREE.BufferGeometry) => {
+      const colorAttr = geom.getAttribute('color');
+      let hasValidColors = false;
+      if (colorAttr && colorAttr.count > 0) {
+        for (let i = 0; i < Math.min(colorAttr.count, 50); i++) {
+          if (colorAttr.getX(i) > 0 || colorAttr.getY(i) > 0 || colorAttr.getZ(i) > 0) {
+            hasValidColors = true;
+            break;
+          }
+        }
+      }
+
+      if (renderMode === 'WIREFRAME') {
+        return new THREE.MeshStandardMaterial({
+          color: 0x10B981,
+          wireframe: true,
+          side: THREE.DoubleSide,
+          clippingPlanes: clipEnabled && clipPlaneRef.current ? [clipPlaneRef.current] : [],
+        });
+      }
+
+      if (renderMode === 'XRAY') {
+        return new THREE.MeshStandardMaterial({
+          color: 0x8A909E,
+          roughness: 0.4,
+          metalness: 0.05,
+          transparent: true,
+          opacity: 0.38,
+          wireframe: false,
+          side: THREE.DoubleSide,
+          clippingPlanes: clipEnabled && clipPlaneRef.current ? [clipPlaneRef.current] : [],
+        });
+      }
+
+      // Default High-Contrast CAD Clay Material
+      return new THREE.MeshStandardMaterial({
+        color: 0xd8dde6,
+        roughness: 0.45,
+        metalness: 0.08,
+        side: THREE.DoubleSide,
+        flatShading: false,
+        vertexColors: hasValidColors,
+        clippingPlanes: clipEnabled && clipPlaneRef.current ? [clipPlaneRef.current] : [],
+        clipShadows: true,
+      });
+    },
+    [renderMode, clipEnabled]
+  );
+
+  // Apply Render Mode Material (SOLID / WIREFRAME / XRAY) to existing meshes
   useEffect(() => {
     if (!currentGroupRef.current) return;
 
@@ -163,41 +224,10 @@ export const CadViewer3D: React.FC<CadViewer3DProps> = ({
       if ((child as THREE.Mesh).isMesh) {
         const mesh = child as THREE.Mesh;
         const geom = mesh.geometry;
-        const hasColors = !!geom.getAttribute('color');
-
-        if (renderMode === 'SOLID') {
-          mesh.material = new THREE.MeshStandardMaterial({
-            color: hasColors ? 0xffffff : 0xECEEF2,
-            roughness: 0.35,
-            metalness: 0.12,
-            wireframe: false,
-            side: THREE.DoubleSide,
-            clippingPlanes: clipEnabled && clipPlaneRef.current ? [clipPlaneRef.current] : [],
-            clipShadows: true,
-            vertexColors: hasColors,
-          });
-        } else if (renderMode === 'WIREFRAME') {
-          mesh.material = new THREE.MeshStandardMaterial({
-            color: 0x10B981,
-            wireframe: true,
-            side: THREE.DoubleSide,
-            clippingPlanes: clipEnabled && clipPlaneRef.current ? [clipPlaneRef.current] : [],
-          });
-        } else if (renderMode === 'XRAY') {
-          mesh.material = new THREE.MeshStandardMaterial({
-            color: 0x8A909E,
-            roughness: 0.2,
-            metalness: 0.1,
-            transparent: true,
-            opacity: 0.38,
-            wireframe: false,
-            side: THREE.DoubleSide,
-            clippingPlanes: clipEnabled && clipPlaneRef.current ? [clipPlaneRef.current] : [],
-          });
-        }
+        mesh.material = buildMaterial(geom);
       }
     });
-  }, [renderMode, clipEnabled]);
+  }, [renderMode, clipEnabled, buildMaterial]);
 
   // Load and Render Active Project's Geometry
   const loadProjectMesh = useCallback(() => {
@@ -242,15 +272,7 @@ export const CadViewer3D: React.FC<CadViewer3DProps> = ({
             const geom = loadGeometryFromBuffer(layer.filename, buffer);
             layer.geometry = geom;
 
-            const material = new THREE.MeshStandardMaterial({
-              color: 0xECEEF2,
-              roughness: 0.35,
-              metalness: 0.12,
-              side: THREE.DoubleSide,
-              clippingPlanes: clipEnabled && clipPlaneRef.current ? [clipPlaneRef.current] : [],
-              clipShadows: true,
-            });
-
+            const material = buildMaterial(geom);
             const mesh = new THREE.Mesh(geom, material);
             mesh.applyMatrix4(layer.transformMatrix);
             mesh.visible = layer.visible;
@@ -281,14 +303,7 @@ export const CadViewer3D: React.FC<CadViewer3DProps> = ({
       if (primary) {
         try {
           const geom = loadGeometryFromBuffer(primary.name, primary.buffer);
-          const material = new THREE.MeshStandardMaterial({
-            color: 0xECEEF2,
-            roughness: 0.35,
-            metalness: 0.12,
-            side: THREE.DoubleSide,
-            clippingPlanes: clipEnabled && clipPlaneRef.current ? [clipPlaneRef.current] : [],
-            clipShadows: true,
-          });
+          const material = buildMaterial(geom);
 
           const mesh = new THREE.Mesh(geom, material);
           mesh.castShadow = true;
@@ -301,30 +316,47 @@ export const CadViewer3D: React.FC<CadViewer3DProps> = ({
     }
 
     if (group.children.length > 0) {
-      // Compute bounding box and snap flush to Y = 0.000 mm
-      const bbox = new THREE.Box3().setFromObject(group);
-      const center = new THREE.Vector3();
-      bbox.getCenter(center);
+      // Rotate CAD Z-up to Three.js Y-up coordinate system
+      group.rotation.x = -Math.PI / 2;
+      group.updateMatrixWorld(true);
 
-      group.position.set(-center.x, -bbox.min.y, -center.z);
+      // Compute exact world bounding box after rotation
+      const box = new THREE.Box3().setFromObject(group);
+      const rawCenter = box.getCenter(new THREE.Vector3());
+
+      // Translate so X and Z center sit at (0, 0) and lowest vertex sits flush at Y = 0.000 mm
+      group.position.x = -rawCenter.x;
+      group.position.y = -box.min.y;
+      group.position.z = -rawCenter.z;
+      group.updateMatrixWorld(true);
+
+      // Recompute box after centering
+      box.setFromObject(group);
+      const center = box.getCenter(new THREE.Vector3());
+      const size = box.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z, 20);
+
       sceneRef.current.add(group);
       currentGroupRef.current = group;
 
       // Update model bounds for Z/Y clipping slider
-      setModelBounds({ min: 0, max: bbox.max.y - bbox.min.y });
+      setModelBounds({ min: box.min.y, max: box.max.y });
 
-      // Auto-fit camera framing
-      const size = new THREE.Vector3();
-      bbox.getSize(size);
-      const maxDim = Math.max(size.x, size.y, size.z, 50);
-
+      // Frame camera with world bounding dimensions
       if (cameraRef.current && controlsRef.current) {
-        cameraRef.current.position.set(maxDim * 1.5, maxDim * 1.2, maxDim * 1.7);
-        controlsRef.current.target.set(0, size.y * 0.45, 0);
+        controlsRef.current.target.copy(center);
+        cameraRef.current.position.set(
+          center.x + maxDim * 1.4,
+          center.y + maxDim * 1.1,
+          center.z + maxDim * 1.4
+        );
+        cameraRef.current.near = maxDim * 0.001;
+        cameraRef.current.far = maxDim * 50;
+        cameraRef.current.updateProjectionMatrix();
         controlsRef.current.update();
       }
     }
-  }, [project, clipEnabled]);
+  }, [project, buildMaterial]);
 
   useEffect(() => {
     loadProjectMesh();
@@ -333,13 +365,20 @@ export const CadViewer3D: React.FC<CadViewer3DProps> = ({
   // Reset Camera View
   const handleResetCamera = () => {
     if (!currentGroupRef.current || !cameraRef.current || !controlsRef.current) return;
-    const bbox = new THREE.Box3().setFromObject(currentGroupRef.current);
-    const size = new THREE.Vector3();
-    bbox.getSize(size);
-    const maxDim = Math.max(size.x, size.y, size.z, 50);
+    const box = new THREE.Box3().setFromObject(currentGroupRef.current);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z, 20);
 
-    cameraRef.current.position.set(maxDim * 1.5, maxDim * 1.2, maxDim * 1.7);
-    controlsRef.current.target.set(0, size.y * 0.45, 0);
+    controlsRef.current.target.copy(center);
+    cameraRef.current.position.set(
+      center.x + maxDim * 1.4,
+      center.y + maxDim * 1.1,
+      center.z + maxDim * 1.4
+    );
+    cameraRef.current.near = maxDim * 0.001;
+    cameraRef.current.far = maxDim * 50;
+    cameraRef.current.updateProjectionMatrix();
     controlsRef.current.update();
   };
 

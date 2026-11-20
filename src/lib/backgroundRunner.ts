@@ -226,3 +226,4 @@ class BackgroundRunnerService {
 }
 
 export const backgroundRunner = new BackgroundRunnerService();
+
