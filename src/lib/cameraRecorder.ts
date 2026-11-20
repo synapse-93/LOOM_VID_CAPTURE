@@ -21,22 +21,21 @@ export class CameraRecorderService {
   private selectedMimeType = '';
 
   /**
-   * Initializes the rear camera with photogrammetry constraints.
-   * Maps NotAllowedError, NotFoundError, and insecure context into actionable messages.
+   * Initializes rear camera with strict 1080p photogrammetry constraints.
    */
   public static async initRearCamera(): Promise<CameraInitResult> {
     if (typeof window === 'undefined') {
-      throw new Error('Camera initialization requires a browser window environment.');
+      throw new Error('Camera initialization requires browser environment.');
     }
 
     if (!window.isSecureContext) {
       throw new Error(
-        'Camera access requires a Secure Context (HTTPS or localhost). Vercel deployments provide HTTPS automatically.'
+        'HTTPS_REQUIRED: Camera access requires secure context (HTTPS / localhost).'
       );
     }
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      throw new Error('Your browser does not support WebRTC mediaDevices API.');
+      throw new Error('ERR_WEBRTC_UNSUPPORTED: MediaDevices API not available.');
     }
 
     try {
@@ -51,26 +50,24 @@ export class CameraRecorderService {
       });
 
       const videoTrack = stream.getVideoTracks()[0];
-      const deviceLabel = videoTrack?.label || 'Rear Environment Camera';
+      const deviceLabel = videoTrack?.label || 'Rear Optical Sensor';
 
       return { stream, videoTrack, deviceLabel };
     } catch (err: unknown) {
       const error = err as { name?: string; message?: string };
       if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
-        throw new Error(
-          'Camera permission denied. Please allow camera access in your browser settings to record 3D scans.'
-        );
+        throw new Error('ERR_PERMISSION_DENIED: Camera permission rejected in browser settings.');
       } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
-        throw new Error('No camera hardware was detected on this device.');
+        throw new Error('ERR_NO_SENSOR: No camera hardware detected on device.');
       } else if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
-        throw new Error('Camera is currently in use by another application or browser tab.');
+        throw new Error('ERR_HARDWARE_LOCKED: Sensor locked by another application.');
       }
-      throw new Error(error.message || 'Unable to access camera.');
+      throw new Error(error.message || 'ERR_CAMERA_UNAVAILABLE: Sensor initialization failed.');
     }
   }
 
   /**
-   * Stops all active tracks on a MediaStream to release camera hardware cleanly.
+   * Stops and releases all MediaStreamTrack instances cleanly.
    */
   public static releaseStream(stream: MediaStream | null) {
     if (!stream) return;
@@ -84,10 +81,10 @@ export class CameraRecorderService {
   }
 
   /**
-   * Negotiates best supported MIME type in strict priority order.
+   * Probes MediaRecorder.isTypeSupported() in strict priority order.
    */
   public static getOptimalMimeType(): string {
-    const priorityList = [
+    const candidateList = [
       'video/mp4;codecs=avc1',
       'video/mp4',
       'video/webm;codecs=h264',
@@ -95,11 +92,9 @@ export class CameraRecorderService {
       'video/webm',
     ];
 
-    if (typeof MediaRecorder === 'undefined') {
-      return '';
-    }
+    if (typeof MediaRecorder === 'undefined') return '';
 
-    for (const mime of priorityList) {
+    for (const mime of candidateList) {
       if (MediaRecorder.isTypeSupported(mime)) {
         return mime;
       }
@@ -113,11 +108,10 @@ export class CameraRecorderService {
   }
 
   /**
-   * Begins high-bitrate recording (10 Mbps) with 1000ms chunk slices.
+   * Starts recording at 10 Mbps (videoBitsPerSecond: 10_000_000) with 1000ms chunk slices.
    */
   public startRecording(onTick?: (elapsedMs: number, bytes: number) => void): boolean {
     if (!this.mediaStream || !this.mediaStream.active) {
-      console.error('[CameraRecorder] Cannot start recording: no active MediaStream');
       return false;
     }
 
@@ -135,11 +129,10 @@ export class CameraRecorderService {
     try {
       this.mediaRecorder = new MediaRecorder(this.mediaStream, options);
     } catch {
-      // Fallback if device rejects bitRate option
       try {
         this.mediaRecorder = new MediaRecorder(this.mediaStream);
       } catch (err) {
-        console.error('[CameraRecorder] MediaRecorder creation failed:', err);
+        console.error('[CameraRecorder] Recorder initialization failed:', err);
         return false;
       }
     }
@@ -150,7 +143,7 @@ export class CameraRecorderService {
       }
     };
 
-    this.mediaRecorder.start(1000); // 1000ms chunk slices
+    this.mediaRecorder.start(1000);
     this.startTime = Date.now();
 
     if (onTick) {
@@ -178,7 +171,7 @@ export class CameraRecorderService {
       }
 
       if (!this.mediaRecorder || this.mediaRecorder.state === 'inactive') {
-        reject(new Error('MediaRecorder is not actively recording.'));
+        reject(new Error('MediaRecorder is inactive.'));
         return;
       }
 
@@ -188,7 +181,6 @@ export class CameraRecorderService {
         const actualMime = this.mediaRecorder?.mimeType || this.selectedMimeType || 'video/mp4';
         const isMp4 = actualMime.toLowerCase().includes('mp4');
         const extension: 'mp4' | 'webm' = isMp4 ? 'mp4' : 'webm';
-
         const finalBlob = new Blob(this.recordedChunks, { type: actualMime });
 
         resolve({
@@ -208,4 +200,3 @@ export class CameraRecorderService {
     return this.mediaRecorder?.state === 'recording';
   }
 }
-

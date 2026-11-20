@@ -1,22 +1,23 @@
-export type CoachingStatus = 'MOTION_BLUR' | 'LOW_TEXTURE' | 'GLARE' | 'OPTIMAL';
+export type OpticalStatus = 'MOTION_BLUR' | 'LOW_TEXTURE' | 'GLARE' | 'OPTIMAL';
+export type OpticalStatusCode = 'ERR_BLUR' | 'WARN_TEXTURE' | 'WARN_GLARE' | 'SYS_LOCKED';
 
 export interface FrameTelemetry {
   sharpnessScore: number;     // 0 - 100
   rawVariance: number;        // Raw Laplacian variance σ²
   textureScore: number;       // 0 - 100
-  overexposedRatio: number;   // 0.0 - 1.0
-  status: CoachingStatus;
-  headline: string;
-  instruction: string;
-  statusColor: string;        // Hex code for status badge and HUD reticle
+  overexposedRatio: number;   // 0.0 - 1.0 (0.0% - 100.0%)
+  status: OpticalStatus;
+  code: OpticalStatusCode;
+  guidance: string;
+  statusColor: string;        // #10B981 | #F59E0B | #EF4444
 }
 
-// Offscreen analysis canvas dimensions
 export const CV_CANVAS_WIDTH = 160;
 export const CV_CANVAS_HEIGHT = 120;
 
 /**
- * Analyzes live video frame on a 160x120 canvas to extract photogrammetry quality metrics.
+ * 10 Hz pure TypeScript pixel analyzer operating on hidden 160x120 canvas.
+ * Works seamlessly for both live camera streams and local test video files.
  */
 export function analyzeFrame(
   video: HTMLVideoElement,
@@ -28,9 +29,9 @@ export function analyzeFrame(
     textureScore: 0,
     overexposedRatio: 0,
     status: 'OPTIMAL',
-    headline: 'STANDBY',
-    instruction: 'Point camera at subject to begin CV inspection',
-    statusColor: '#94a3b8',
+    code: 'SYS_LOCKED',
+    guidance: 'OPTICAL LOCK — MAINTAIN STEADY ORBIT',
+    statusColor: '#8A909E',
   };
 
   if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
@@ -58,37 +59,36 @@ export function analyzeFrame(
 
   const data = imgData.data;
   const W = CV_CANVAS_WIDTH;
+  const H = CV_CANVAS_HEIGHT;
 
-  // Pre-calculate full luminance buffer (160 x 120)
-  // Luminance: Y = 0.299R + 0.587G + 0.114B
-  const lum = new Uint8Array(W * CV_CANVAS_HEIGHT);
+  // Grayscale luminance array (160x120): Y = 0.299R + 0.587G + 0.114B
+  const lum = new Uint8Array(W * H);
   for (let i = 0, p = 0; i < data.length; i += 4, p++) {
     lum[p] = (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) >> 10;
   }
 
-  // 1. Motion Blur / Edge Sharpness on Center Box (x: 40..120, y: 30..90)
-  // Region width = 80, height = 60
+  // 1. Laplacian Edge Sharpness on Center 80x60 region (x: 40..120, y: 30..90)
   const cxMin = 40;
   const cxMax = 120;
   const cyMin = 30;
   const cyMax = 90;
 
-  let centerPixelsCount = 0;
-  let overexposedPixelsCount = 0;
+  let centerPixelCount = 0;
+  let overexposedPixelCount = 0;
   let laplacianSum = 0;
   let laplacianSqSum = 0;
-  let laplacianSampleCount = 0;
+  let laplacianCount = 0;
 
-  // Discrete 3x3 Laplacian kernel [0, 1, 0, 1, -4, 1, 0, 1, 0]
+  // Discrete 3x3 Laplacian kernel: [0, 1, 0, 1, -4, 1, 0, 1, 0]
   for (let y = cyMin; y < cyMax; y++) {
     const rowOffset = y * W;
     for (let x = cxMin; x < cxMax; x++) {
       const idx = rowOffset + x;
       const val = lum[idx];
 
-      centerPixelsCount++;
+      centerPixelCount++;
       if (val > 245) {
-        overexposedPixelsCount++;
+        overexposedPixelCount++;
       }
 
       // Laplacian sample with 1px border margin
@@ -101,32 +101,29 @@ export function analyzeFrame(
         const lap = up + down + left + right - 4 * val;
         laplacianSum += lap;
         laplacianSqSum += lap * lap;
-        laplacianSampleCount++;
+        laplacianCount++;
       }
     }
   }
 
-  // Compute variance σ² = E[X²] - (E[X])²
+  // Variance σ² = E[X²] - (E[X])²
   let variance = 0;
-  if (laplacianSampleCount > 0) {
-    const meanLap = laplacianSum / laplacianSampleCount;
-    const meanLapSq = laplacianSqSum / laplacianSampleCount;
+  if (laplacianCount > 0) {
+    const meanLap = laplacianSum / laplacianCount;
+    const meanLapSq = laplacianSqSum / laplacianCount;
     variance = Math.max(0, meanLapSq - meanLap * meanLap);
   }
 
-  // Map variance to 0-100 score (variance ~85 is the threshold)
-  // Variance typically ranges 0 to 400+
-  const sharpnessScore = Math.min(100, Math.round((variance / 180) * 100));
+  // Normalize sharpness score (0 - 100), variance < 85 indicates motion blur
+  const sharpnessScore = Math.min(100, Math.round((variance / 170) * 100));
   const isBlurry = variance < 85;
 
-  // 2. Surface & Background Texture Density:
-  // Compute horizontal and vertical Sobel gradient magnitudes across center subject box
-  // AND lower support-plane margin (y: 85..115)
-  // G = |G_x| + |G_y|
+  // 2. Sobel Surface Texture Density (0 - 100):
+  // Compute Sobel gradient magnitude G = |Gx| + |Gy| across center subject box
+  // AND lower table margin (y: 85..115)
   let textureSampleCount = 0;
-  let highGradientCount = 0;
+  let highEdgeCount = 0;
 
-  // Scan center region + lower support plane margin (y: 30..115, x: 20..140)
   const texYMin = 30;
   const texYMax = 115;
   const texXMin = 20;
@@ -137,61 +134,58 @@ export function analyzeFrame(
     for (let x = texXMin; x < texXMax; x++) {
       const idx = rowOffset + x;
 
-      // Sobel gradient approximation:
-      // Gx = lum[x+1, y] - lum[x-1, y]
-      // Gy = lum[x, y+1] - lum[x, y-1]
       const gx = lum[idx + 1] - lum[idx - 1];
       const gy = lum[idx + W] - lum[idx - W];
       const gMagnitude = Math.abs(gx) + Math.abs(gy);
 
       textureSampleCount++;
       if (gMagnitude > 28) {
-        highGradientCount++;
+        highEdgeCount++;
       }
     }
   }
 
   const textureScore = textureSampleCount > 0
-    ? Math.min(100, Math.round((highGradientCount / textureSampleCount) * 100))
+    ? Math.min(100, Math.round((highEdgeCount / textureSampleCount) * 100))
     : 0;
   const hasLowTexture = textureScore < 22;
 
-  // 3. Specular Glare Detector: fraction of center pixels with luminance > 245
-  const overexposedRatio = centerPixelsCount > 0
-    ? Math.round((overexposedPixelsCount / centerPixelsCount) * 1000) / 1000
+  // 3. Specular Glare Ratio: fraction of center pixels with luminance > 245
+  const overexposedRatio = centerPixelCount > 0
+    ? Math.round((overexposedPixelCount / centerPixelCount) * 1000) / 1000
     : 0;
   const isOverexposed = overexposedRatio > 0.18;
 
-  // 4. Deterministic Priority Coaching State Machine
-  // Priority 1: MOTION_BLUR
-  // Priority 2: LOW_TEXTURE
-  // Priority 3: GLARE
-  // Priority 4: OPTIMAL
-  let status: CoachingStatus;
-  let headline: string;
-  let instruction: string;
+  // 4. Deterministic Coaching Output (Priority Hierarchy)
+  // Priority 1: MOTION_BLUR -> "MOTION BLUR — REDUCE ORBIT VELOCITY"
+  // Priority 2: LOW_TEXTURE -> "LOW TEXTURE — PLACE PRINTED ANCHOR SHEET"
+  // Priority 3: GLARE       -> "SPECULAR GLARE — ADJUST CAMERA TILT"
+  // Priority 4: OPTIMAL     -> "OPTICAL LOCK — MAINTAIN STEADY ORBIT"
+  let status: OpticalStatus;
+  let code: OpticalStatusCode;
+  let guidance: string;
   let statusColor: string;
 
   if (isBlurry) {
     status = 'MOTION_BLUR';
-    headline = 'TOO FAST / BLURRY';
-    instruction = 'Slow down your walk to lock SIFT features';
-    statusColor = '#f59e0b'; // Amber Warning
+    code = 'ERR_BLUR';
+    guidance = 'MOTION BLUR — REDUCE ORBIT VELOCITY';
+    statusColor = '#EF4444'; // Critical Red
   } else if (hasLowTexture) {
     status = 'LOW_TEXTURE';
-    headline = 'LOW SURFACE TEXTURE';
-    instruction = 'Place newspaper or patterned sheet beneath object';
-    statusColor = '#f59e0b'; // Amber Warning
+    code = 'WARN_TEXTURE';
+    guidance = 'LOW TEXTURE — PLACE PRINTED ANCHOR SHEET';
+    statusColor = '#F59E0B'; // Caution Amber
   } else if (isOverexposed) {
     status = 'GLARE';
-    headline = 'SPECULAR GLARE';
-    instruction = 'Tilt camera slightly to avoid light reflection';
-    statusColor = '#ff4d4d'; // Crimson Alert
+    code = 'WARN_GLARE';
+    guidance = 'SPECULAR GLARE — ADJUST CAMERA TILT';
+    statusColor = '#F59E0B'; // Caution Amber
   } else {
     status = 'OPTIMAL';
-    headline = 'LOCKED & SHARP';
-    instruction = 'Maintain steady pace around the orbit ring';
-    statusColor = '#00e599'; // Emerald Optimal
+    code = 'SYS_LOCKED';
+    guidance = 'OPTICAL LOCK — MAINTAIN STEADY ORBIT';
+    statusColor = '#10B981'; // Optimal Green
   }
 
   return {
@@ -200,9 +194,8 @@ export function analyzeFrame(
     textureScore,
     overexposedRatio,
     status,
-    headline,
-    instruction,
+    code,
+    guidance,
     statusColor,
   };
 }
-

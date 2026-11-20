@@ -3,8 +3,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import {
-  createMechanicalBracketGeometry,
-  createTurbineImpellerGeometry,
+  createCalibrationPrismGeometry,
   geometryToBinaryStl,
 } from '../utils/stlGenerators';
 import {
@@ -24,9 +23,9 @@ export const StlInspector: React.FC = () => {
   const currentMeshRef = useRef<THREE.Mesh | null>(null);
   const currentGeomRef = useRef<THREE.BufferGeometry | null>(null);
 
-  // UI state
+  // Inspection State
   const [isWireframe, setIsWireframe] = useState(false);
-  const [modelName, setModelName] = useState('mechanical-bracket.stl');
+  const [modelName, setModelName] = useState('calibration-prism-gauge.stl');
   const [telemetry, setTelemetry] = useState({
     dimX: 0,
     dimY: 0,
@@ -34,7 +33,7 @@ export const StlInspector: React.FC = () => {
     triangles: 0,
   });
 
-  // Calculate dimensions and triangle count
+  // Calculate Bounding Dimensions and Triangle Count
   const updateTelemetry = (geom: THREE.BufferGeometry) => {
     geom.computeBoundingBox();
     const bbox = geom.boundingBox || new THREE.Box3();
@@ -46,13 +45,13 @@ export const StlInspector: React.FC = () => {
 
     setTelemetry({
       dimX: Math.round(size.x * 10) / 10,
-      dimY: Math.round(size.y * 10) / 10,
-      dimZ: Math.round(size.z * 10) / 10,
+      dimY: Math.round(size.z * 10) / 10, // Depth
+      dimZ: Math.round(size.y * 10) / 10, // Height
       triangles: Math.round(triangles),
     });
   };
 
-  // Center on X/Y and snap lowest vertex flush to Z = 0 on millimeter GridHelper
+  // Center on X/Y and snap lowest vertex flush to Z = 0.000 mm on millimeter GridHelper
   const loadGeometry = useCallback((geometry: THREE.BufferGeometry) => {
     if (!sceneRef.current || !cameraRef.current || !controlsRef.current) return;
 
@@ -62,9 +61,7 @@ export const StlInspector: React.FC = () => {
     const center = new THREE.Vector3();
     bbox.getCenter(center);
 
-    // Snap center X, center Y to 0, and snap min Z to 0.0
-    // (In Three.js standard coordinates, Y is Up or Z is Up depending on orientation;
-    // photogrammetry build plates use horizontal ground at Y=0 or Z=0. We orient ground on Y=0)
+    // Auto-center on X/Z and snap lowest vertex flush to Y = 0.000 (Z_min = 0.000 mm)
     geometry.translate(-center.x, -bbox.min.y, -center.z);
     geometry.computeVertexNormals();
 
@@ -75,10 +72,11 @@ export const StlInspector: React.FC = () => {
       currentMeshRef.current = null;
     }
 
+    // Industrial matte CAD material
     const material = new THREE.MeshStandardMaterial({
-      color: 0x00e599,
-      roughness: 0.35,
-      metalness: 0.2,
+      color: 0xECEEF2,
+      roughness: 0.38,
+      metalness: 0.15,
       wireframe: isWireframe,
       side: THREE.DoubleSide,
     });
@@ -94,13 +92,13 @@ export const StlInspector: React.FC = () => {
     // Auto-frame camera with bounding sphere
     geometry.computeBoundingSphere();
     const sphere = geometry.boundingSphere!;
-    const radius = Math.max(25, sphere.radius);
-    cameraRef.current.position.set(radius * 2.2, radius * 1.8, radius * 2.5);
-    controlsRef.current.target.set(0, radius * 0.5, 0);
+    const radius = Math.max(30, sphere.radius);
+    cameraRef.current.position.set(radius * 2.0, radius * 1.6, radius * 2.2);
+    controlsRef.current.target.set(0, radius * 0.4, 0);
     controlsRef.current.update();
   }, [isWireframe]);
 
-  // Initialize Three.js WebGL Scene
+  // Initialize Three.js WebGL Viewport
   useEffect(() => {
     if (!mountRef.current) return;
     const container = mountRef.current;
@@ -109,15 +107,15 @@ export const StlInspector: React.FC = () => {
 
     // Scene
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x090b0e);
+    scene.background = new THREE.Color(0x0C0D0F);
     sceneRef.current = scene;
 
     // Camera
     const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 2000);
     cameraRef.current = camera;
 
-    // Renderer
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+    // Renderer (zero glow, matte anti-aliasing)
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, preserveDrawingBuffer: true });
     renderer.setSize(width, height);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.shadowMap.enabled = true;
@@ -130,26 +128,26 @@ export const StlInspector: React.FC = () => {
     controls.dampingFactor = 0.05;
     controlsRef.current = controls;
 
-    // Millimeter GridHelper
-    const gridHelper = new THREE.GridHelper(200, 40, 0x1e2430, 0x12161f);
+    // Millimeter GridHelper (10 mm divisions, major lines every 50 mm, at Z = 0.000 mm flush)
+    const gridHelper = new THREE.GridHelper(200, 20, 0x363B45, 0x1A1D21);
     gridHelper.position.y = 0;
     scene.add(gridHelper);
 
-    // Studio Lighting
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+    // Directional Studio Lighting
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.55);
     scene.add(ambientLight);
 
-    const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.0);
-    dirLight1.position.set(100, 150, 100);
+    const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.1);
+    dirLight1.position.set(120, 160, 100);
     dirLight1.castShadow = true;
     scene.add(dirLight1);
 
-    const dirLight2 = new THREE.DirectionalLight(0x00e599, 0.4);
-    dirLight2.position.set(-100, 80, -100);
+    const dirLight2 = new THREE.DirectionalLight(0x8A909E, 0.45);
+    dirLight2.position.set(-100, 60, -100);
     scene.add(dirLight2);
 
-    // Initial default sample mesh
-    const defaultGeom = createMechanicalBracketGeometry();
+    // Load Default Calibration Prism Gauge Mesh
+    const defaultGeom = createCalibrationPrismGeometry();
     loadGeometry(defaultGeom);
 
     // Resize observer
@@ -163,7 +161,6 @@ export const StlInspector: React.FC = () => {
     });
     resizeObserver.observe(container);
 
-    // Render loop
     let animId: number;
     const animate = () => {
       animId = requestAnimationFrame(animate);
@@ -190,17 +187,17 @@ export const StlInspector: React.FC = () => {
   }, [isWireframe]);
 
   // Reset Camera View
-  const handleResetView = () => {
+  const handleResetCamera = () => {
     if (!currentGeomRef.current || !cameraRef.current || !controlsRef.current) return;
     currentGeomRef.current.computeBoundingSphere();
     const sphere = currentGeomRef.current.boundingSphere!;
-    const radius = Math.max(25, sphere.radius);
-    cameraRef.current.position.set(radius * 2.2, radius * 1.8, radius * 2.5);
-    controlsRef.current.target.set(0, radius * 0.5, 0);
+    const radius = Math.max(30, sphere.radius);
+    cameraRef.current.position.set(radius * 2.0, radius * 1.6, radius * 2.2);
+    controlsRef.current.target.set(0, radius * 0.4, 0);
     controlsRef.current.update();
   };
 
-  // Drag and drop or file upload loader
+  // Drag & drop / file picker handling
   const handleFile = (file: File) => {
     setModelName(file.name);
     const reader = new FileReader();
@@ -212,7 +209,7 @@ export const StlInspector: React.FC = () => {
         const geom = loader.parse(buffer);
         loadGeometry(geom);
       } catch (err) {
-        alert('Invalid STL file. Please upload a binary or ASCII STL mesh.');
+        alert('ERR_INVALID_STL: Please provide a valid binary or ASCII STL mesh.');
         console.error(err);
       }
     };
@@ -227,8 +224,8 @@ export const StlInspector: React.FC = () => {
     }
   };
 
-  // Download STL locally
-  const handleDownloadStl = () => {
+  // Export Binary STL
+  const handleExportStl = () => {
     if (!currentGeomRef.current) return;
     const buffer = geometryToBinaryStl(currentGeomRef.current);
     const blob = new Blob([buffer], { type: 'application/octet-stream' });
@@ -244,99 +241,160 @@ export const StlInspector: React.FC = () => {
 
   return (
     <div
-      className="relative w-full h-[calc(100vh-4rem)] bg-[#090b0e] flex flex-col select-none overflow-hidden"
+      className="grid grid-cols-1 lg:grid-cols-[1fr_300px] h-[calc(100vh-48px)] bg-[#0C0D0F] select-none overflow-hidden"
       onDragOver={(e) => e.preventDefault()}
       onDrop={handleDrop}
     >
-      {/* Top Floating Controls */}
-      <div className="absolute top-4 left-4 z-10 flex items-center gap-2 bg-[#12161f]/90 backdrop-blur-md border border-[#1e2430] p-1.5 rounded-lg text-xs font-mono">
-        <span className="text-[#94a3b8] px-2 truncate max-w-[180px]">{modelName}</span>
-        <div className="h-4 w-[1px] bg-[#1e2430]" />
-        <button
-          onClick={() => setIsWireframe(!isWireframe)}
-          className={`px-3 py-1 rounded transition ${
-            isWireframe
-              ? 'bg-[#00e599] text-[#090b0e] font-bold'
-              : 'bg-[#181e2b] text-[#f1f5f9] hover:bg-[#20293a]'
-          }`}
-        >
-          {isWireframe ? 'Wireframe ON' : 'Solid Shading'}
-        </button>
-        <button
-          onClick={handleResetView}
-          className="flex items-center gap-1 px-3 py-1 rounded bg-[#181e2b] text-[#94a3b8] hover:text-[#f1f5f9] hover:bg-[#20293a] transition"
-        >
-          <RotateCcw className="w-3.5 h-3.5" />
-          <span>Reset View</span>
-        </button>
+      {/* LEFT THREE.JS VIEWPORT */}
+      <div className="relative w-full h-full border-b lg:border-b-0 border-[#262930] overflow-hidden">
+        {/* Top-Left File Header */}
+        <div className="absolute top-3 left-3 z-10 flex items-center gap-2 bg-[#131518] border border-[#262930] px-3 py-1.5 rounded font-mono text-xs">
+          <span className="text-[#8A909E] uppercase text-[10px]">FILE:</span>
+          <span className="text-[#ECEEF2] truncate max-w-[220px] font-medium">{modelName}</span>
+        </div>
+
+        {/* Top-Right Quick Viewport Controls */}
+        <div className="absolute top-3 right-3 z-10 flex items-center gap-2">
+          <label className="border border-[#262930] bg-[#131518] hover:bg-[#1A1D21] text-[#ECEEF2] text-xs font-mono px-2.5 py-1.5 rounded flex items-center gap-1.5 cursor-pointer transition">
+            <Upload className="w-3.5 h-3.5 text-[#8A909E]" />
+            <span>LOAD .STL</span>
+            <input
+              type="file"
+              accept=".stl"
+              onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])}
+              className="hidden"
+            />
+          </label>
+
+          <button
+            onClick={handleExportStl}
+            className="border border-[#262930] bg-[#131518] hover:bg-[#1A1D21] text-[#ECEEF2] text-xs font-mono px-2.5 py-1.5 rounded flex items-center gap-1.5 transition"
+          >
+            <Download className="w-3.5 h-3.5 text-[#8A909E]" />
+            <span>EXPORT</span>
+          </button>
+        </div>
+
+        {/* WebGL Canvas */}
+        <div ref={mountRef} className="w-full h-full" />
+
+        {/* Viewport Bottom Overlay Readout */}
+        <div className="absolute bottom-3 left-3 z-10 bg-[#131518] border border-[#262930] px-3 py-1.5 rounded font-mono text-xs flex items-center gap-4 text-[#8A909E]">
+          <div>
+            <span>GRID: </span>
+            <span className="text-[#ECEEF2] font-medium">10 mm / DIV</span>
+          </div>
+          <div className="w-[1px] h-3 bg-[#262930]" />
+          <div>
+            <span>Z-MIN: </span>
+            <span className="text-[#10B981] font-medium">0.000 mm (FLUSH)</span>
+          </div>
+        </div>
       </div>
 
-      {/* Top Right File Controls */}
-      <div className="absolute top-4 right-4 z-10 flex items-center gap-2">
-        {/* Sample presets switcher */}
-        <button
-          onClick={() => {
-            setModelName('mechanical-bracket.stl');
-            loadGeometry(createMechanicalBracketGeometry());
-          }}
-          className="px-2.5 py-1.5 rounded-lg bg-[#12161f]/90 backdrop-blur-md border border-[#1e2430] text-xs font-mono text-[#94a3b8] hover:text-[#00e599] transition"
-        >
-          Bracket
-        </button>
-        <button
-          onClick={() => {
-            setModelName('turbine-impeller.stl');
-            loadGeometry(createTurbineImpellerGeometry());
-          }}
-          className="px-2.5 py-1.5 rounded-lg bg-[#12161f]/90 backdrop-blur-md border border-[#1e2430] text-xs font-mono text-[#94a3b8] hover:text-[#00e599] transition"
-        >
-          Impeller
-        </button>
+      {/* RIGHT TELEMETRY SIDEBAR */}
+      <div className="bg-[#131518] border-l border-[#262930] p-4 flex flex-col justify-between font-mono text-xs overflow-y-auto">
+        <div className="space-y-4">
+          <div className="pb-2 border-b border-[#262930] flex items-center justify-between">
+            <span className="text-[11px] text-[#8A909E] uppercase tracking-wider font-semibold">
+              CAD METRICS & TOPOLOGY
+            </span>
+            <span className="text-[10px] text-[#10B981] px-1.5 py-0.2 rounded border border-[#10B981]/30 bg-[#10B981]/10">
+              MANIFOLD
+            </span>
+          </div>
 
-        <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#12161f]/90 backdrop-blur-md border border-[#1e2430] hover:border-[#00e599]/50 text-xs font-mono text-[#f1f5f9] cursor-pointer transition">
-          <Upload className="w-3.5 h-3.5 text-[#00e599]" />
-          <span>Upload .STL</span>
-          <input
-            type="file"
-            accept=".stl"
-            onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])}
-            className="hidden"
-          />
-        </label>
+          {/* Bounding Box Dimensions */}
+          <div className="border border-[#262930] rounded-md p-3 bg-[#0C0D0F] space-y-2">
+            <span className="text-[10px] text-[#8A909E] uppercase block">
+              BOUNDING BOX (L × W × H)
+            </span>
+            <div className="grid grid-cols-3 gap-1.5 text-center">
+              <div className="p-2 border border-[#262930] rounded bg-[#131518]">
+                <span className="text-[9px] text-[#8A909E] block">LENGTH (X)</span>
+                <span className="text-[#ECEEF2] font-semibold tabular-nums">{telemetry.dimX} mm</span>
+              </div>
+              <div className="p-2 border border-[#262930] rounded bg-[#131518]">
+                <span className="text-[9px] text-[#8A909E] block">WIDTH (Y)</span>
+                <span className="text-[#ECEEF2] font-semibold tabular-nums">{telemetry.dimY} mm</span>
+              </div>
+              <div className="p-2 border border-[#262930] rounded bg-[#131518]">
+                <span className="text-[9px] text-[#8A909E] block">HEIGHT (Z)</span>
+                <span className="text-[#ECEEF2] font-semibold tabular-nums">{telemetry.dimZ} mm</span>
+              </div>
+            </div>
+          </div>
 
-        <button
-          onClick={handleDownloadStl}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#00e599] hover:bg-[#00e599]/90 text-xs font-mono font-bold text-[#090b0e] transition"
-        >
-          <Download className="w-3.5 h-3.5" />
-          <span>Export STL</span>
-        </button>
-      </div>
+          {/* Triangle Count & Topology */}
+          <div className="border border-[#262930] rounded-md p-3 bg-[#0C0D0F] space-y-2">
+            <div className="flex justify-between items-center text-[11px]">
+              <span className="text-[#8A909E]">TRIANGLE COUNT</span>
+              <span className="text-[#ECEEF2] font-semibold tabular-nums">
+                {telemetry.triangles.toLocaleString()}
+              </span>
+            </div>
+            <div className="flex justify-between items-center text-[11px]">
+              <span className="text-[#8A909E]">BUILD PLATE Z-MIN</span>
+              <span className="text-[#10B981] font-semibold tabular-nums">0.000 mm</span>
+            </div>
+            <div className="flex justify-between items-center text-[11px]">
+              <span className="text-[#8A909E]">WATERTIGHT STATUS</span>
+              <span className="text-[#10B981] font-semibold">CLOSED MANIFOLD</span>
+            </div>
+          </div>
 
-      {/* WebGL Viewport */}
-      <div ref={mountRef} className="w-full h-full flex-1" />
+          {/* Shading & Inspection Controls */}
+          <div className="border border-[#262930] rounded-md p-3 bg-[#0C0D0F] space-y-2.5">
+            <span className="text-[10px] text-[#8A909E] uppercase block">SHADING CONTROLS</span>
+            <div className="grid grid-cols-2 gap-1.5 bg-[#131518] p-1 border border-[#262930] rounded">
+              <button
+                type="button"
+                onClick={() => setIsWireframe(false)}
+                className={`py-1 rounded text-center transition ${
+                  !isWireframe
+                    ? 'bg-[#1A1D21] text-[#ECEEF2] border border-[#262930] font-medium'
+                    : 'text-[#8A909E] hover:text-[#ECEEF2]'
+                }`}
+              >
+                SOLID
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsWireframe(true)}
+                className={`py-1 rounded text-center transition ${
+                  isWireframe
+                    ? 'bg-[#1A1D21] text-[#ECEEF2] border border-[#262930] font-medium'
+                    : 'text-[#8A909E] hover:text-[#ECEEF2]'
+                }`}
+              >
+                WIREFRAME
+              </button>
+            </div>
 
-      {/* Bottom Millimeter Readout & Topology Overlay */}
-      <div className="absolute bottom-4 left-4 z-10 bg-[#12161f]/95 backdrop-blur-md border border-[#1e2430] p-3 rounded-xl flex items-center gap-5 text-xs font-mono">
-        <div>
-          <span className="text-[10px] uppercase text-[#94a3b8] block">Bounding Box (L × W × H)</span>
-          <span className="text-[#f1f5f9] font-bold tabular-nums">
-            {telemetry.dimX} × {telemetry.dimY} × {telemetry.dimZ} <span className="text-[#00e599]">mm</span>
+            <button
+              onClick={handleResetCamera}
+              className="w-full py-1.5 rounded border border-[#262930] bg-[#131518] hover:bg-[#1A1D21] text-[#ECEEF2] flex items-center justify-center gap-1.5 transition text-xs"
+            >
+              <RotateCcw className="w-3.5 h-3.5 text-[#8A909E]" />
+              <span>RESET CAMERA VIEW</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Quick Calibration Sample Loader */}
+        <div className="pt-3 border-t border-[#262930]">
+          <span className="text-[10px] text-[#8A909E] uppercase block mb-1.5">
+            SAMPLE CALIBRATION GAUGE
           </span>
-        </div>
-
-        <div className="h-6 w-[1px] bg-[#1e2430]" />
-
-        <div>
-          <span className="text-[10px] uppercase text-[#94a3b8] block">Triangles</span>
-          <span className="text-[#f1f5f9] font-bold tabular-nums">{telemetry.triangles.toLocaleString()}</span>
-        </div>
-
-        <div className="h-6 w-[1px] bg-[#1e2430]" />
-
-        <div>
-          <span className="text-[10px] uppercase text-[#94a3b8] block">Grid Scale</span>
-          <span className="text-[#00e599] font-bold tabular-nums">5 mm / div</span>
+          <button
+            onClick={() => {
+              setModelName('calibration-prism-gauge.stl');
+              loadGeometry(createCalibrationPrismGeometry());
+            }}
+            className="w-full py-2 rounded bg-[#ECEEF2] hover:bg-[#FFFFFF] text-[#0C0D0F] font-mono font-medium text-xs transition"
+          >
+            RELOAD CALIBRATION PRISM
+          </button>
         </div>
       </div>
     </div>

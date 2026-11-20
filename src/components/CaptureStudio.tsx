@@ -1,389 +1,283 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import confetti from 'canvas-confetti';
 import {
-  Play,
-  Square,
-  Camera,
-  AlertTriangle,
-  CheckCircle2,
-  Sparkles,
-  Zap,
   Volume2,
   VolumeX,
-  ChevronRight,
-  Info,
-  QrCode,
+  Upload,
   Download,
+  Copy,
+  Check,
+  AlertTriangle,
+  RotateCcw,
 } from 'lucide-react';
-import { CVTelemetryEngine } from '../services/cvEngine';
-import { HighBitrateRecorder } from '../services/videoRecorder';
-import { loomBridge } from '../services/loomBridge';
-import { TelemetryMetrics, OrbitState, ScanPreset, CaptureMetadata } from '../types/capture';
+import { analyzeFrame, FrameTelemetry, CV_CANVAS_WIDTH, CV_CANVAS_HEIGHT } from '../lib/cvGuidance';
+import { CameraRecorderService, RecorderResult } from '../lib/cameraRecorder';
 
-interface CaptureStudioProps {
-  onOpenInspector: () => void;
-  onOpenLoomBridge: () => void;
-  onOpenQrModal: () => void;
-  onOpenGuideModal: () => void;
-}
-
-export const CaptureStudio: React.FC<CaptureStudioProps> = ({
-  onOpenInspector,
-  onOpenLoomBridge,
-  onOpenQrModal,
-  onOpenGuideModal,
-}) => {
+export const CaptureStudio: React.FC = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const cvEngineRef = useRef<CVTelemetryEngine | null>(null);
-  const recorderRef = useRef<HighBitrateRecorder | null>(null);
+  const cvCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const activeStreamRef = useRef<MediaStream | null>(null);
+  const recorderServiceRef = useRef<CameraRecorderService>(new CameraRecorderService());
+  const localFileObjectUrlRef = useRef<string | null>(null);
 
-  // Device & Camera State
-  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
-  const [targetResolution, setTargetResolution] = useState<'1080p' | '4k' | '720p'>('1080p');
-  const [cameraPermission, setCameraPermission] = useState<'pending' | 'granted' | 'denied'>('pending');
-  const [torchAvailable, setTorchAvailable] = useState(false);
-  const [torchOn, setTorchOn] = useState(false);
+  // Acquisition Protocol Checklist (Section A)
+  const [checklist, setChecklist] = useState({
+    baseplate: false,
+    cavities: false,
+    cameraAngle: false,
+  });
+
+  // Camera & Mode State
+  const [cameraMode, setCameraMode] = useState<'live' | 'local_file'>('live');
+  const [cameraError, setCameraError] = useState<string | null>(null);
   const [soundEnabled, setSoundEnabled] = useState(true);
 
-  // Live CV Telemetry State (10 Hz)
-  const [metrics, setMetrics] = useState<TelemetryMetrics>({
-    sharpness: 120,
-    textureDensity: 45,
-    glarePercentage: 0.5,
-    luminanceAvg: 110,
-    isMotionBlur: false,
-    isFeatureless: false,
-    isGlareDetected: false,
-    overallStatus: 'optimal',
-    statusMessage: 'Ready to scan',
+  // Optical Telemetry (Section B)
+  const [telemetry, setTelemetry] = useState<FrameTelemetry>({
+    sharpnessScore: 0,
+    rawVariance: 0,
+    textureScore: 0,
+    overexposedRatio: 0,
+    status: 'OPTIMAL',
+    code: 'SYS_LOCKED',
+    guidance: 'OPTICAL LOCK — MAINTAIN STEADY ORBIT',
+    statusColor: '#8A909E',
   });
 
-  // Orbital Pacing State
-  const [scanPreset, setScanPreset] = useState<ScanPreset>('single-30');
-  const [orbitState, setOrbitState] = useState<OrbitState>({
-    currentAngle: 0,
-    targetAngle: 0,
-    angularSpeedDegPerSec: 12,
-    elevationAngle: 42,
-    targetTier: 'mid',
-    lapsCompleted: 0,
-    targetLaps: 1,
-    progressPercent: 0,
-    pacingState: 'on_track',
-  });
+  // Scan Parameters (Section C)
+  const [orbitDurationSec, setOrbitDurationSec] = useState<45 | 60>(45);
+  const [targetPrintLengthMm, setTargetPrintLengthMm] = useState<number>(200);
 
   // Recording State
   const [isRecording, setIsRecording] = useState(false);
-  const [recordedDurationMs, setRecordedDurationMs] = useState(0);
-  const [recordedBytes, setRecordedBytes] = useState(0);
-  const [currentBitrateMbps, setCurrentBitrateMbps] = useState(10.0);
-  const [completedCapture, setCompletedCapture] = useState<{
-    metadata: CaptureMetadata;
-    videoBlob: Blob;
-    videoUrl: string;
+  const [elapsedMs, setElapsedMs] = useState(0);
+
+  // Post-Capture Export Card (Section D)
+  const [completedResult, setCompletedResult] = useState<{
+    result: RecorderResult;
+    url: string;
+    avgSharpness: number;
+    avgTexture: number;
+    passed: boolean;
+    timestampName: string;
   } | null>(null);
 
-  // History samples for metadata sidecar
-  const telemetrySamplesRef = useRef<CaptureMetadata['samples']>([]);
+  const [copiedCli, setCopiedCli] = useState(false);
 
-  // Initialize CV Engine & Recorder instances
-  useEffect(() => {
-    const engine = new CVTelemetryEngine({
-      sampleRateHz: 10,
-      enableAudio: soundEnabled,
-      enableHaptics: true,
-    });
-    cvEngineRef.current = engine;
+  // Speech synthesis cooldown (max 1 spoken alert per 4s)
+  const lastSpokenTimeRef = useRef(0);
+  const lastSpokenTextRef = useRef('');
+  const telemetryHistoryRef = useRef<Array<{ sharpness: number; texture: number }>>([]);
 
-    engine.onMetrics((m) => {
-      setMetrics(m);
-      if (isRecording) {
-        telemetrySamplesRef.current.push({
-          time: Date.now(),
-          sharpness: m.sharpness,
-          texture: m.textureDensity,
-          glare: m.glarePercentage,
-          angle: orbitState.currentAngle,
-          elevation: orbitState.elevationAngle,
-        });
-      }
-    });
+  // Initialize Camera
+  const startLiveCamera = useCallback(async () => {
+    setCameraError(null);
+    setCameraMode('live');
 
-    const recorder = new HighBitrateRecorder(10_000_000); // 10 Mbps
-    recorderRef.current = recorder;
+    if (localFileObjectUrlRef.current) {
+      URL.revokeObjectURL(localFileObjectUrlRef.current);
+      localFileObjectUrlRef.current = null;
+    }
 
-    recorder.onStats((stats) => {
-      setIsRecording(stats.isRecording);
-      setRecordedDurationMs(stats.durationMs);
-      setRecordedBytes(stats.bytesRecorded);
-      setCurrentBitrateMbps(stats.currentBitrateMbps);
-    });
+    CameraRecorderService.releaseStream(activeStreamRef.current);
 
-    return () => {
-      engine.destroy();
-      stopCamera();
-    };
-  }, []);
-
-  // Update sound setting on engine
-  useEffect(() => {
-    cvEngineRef.current?.setConfig({ enableAudio: soundEnabled });
-  }, [soundEnabled]);
-
-  // Request camera and list devices
-  const initCamera = useCallback(async () => {
     try {
-      setCameraPermission('pending');
-      stopCamera();
-
-      // Constraints with preferred resolution
-      const resMap = {
-        '4k': { width: { ideal: 3840 }, height: { ideal: 2160 } },
-        '1080p': { width: { ideal: 1920 }, height: { ideal: 1080 } },
-        '720p': { width: { ideal: 1280 }, height: { ideal: 720 } },
-      };
-
-      const videoConstraints: MediaTrackConstraints = {
-        ...resMap[targetResolution],
-        frameRate: { ideal: 60, min: 30 },
-      };
-
-      if (selectedDeviceId) {
-        videoConstraints.deviceId = { exact: selectedDeviceId };
-      } else {
-        videoConstraints.facingMode = { ideal: 'environment' }; // Prefer back camera
-      }
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: videoConstraints,
-        audio: false,
-      });
-
-      streamRef.current = stream;
+      const { stream } = await CameraRecorderService.initRearCamera();
+      activeStreamRef.current = stream;
+      recorderServiceRef.current.setStream(stream);
 
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
+        videoRef.current.loop = false;
         await videoRef.current.play().catch(() => {});
-        cvEngineRef.current?.setVideoSource(videoRef.current);
-        cvEngineRef.current?.start();
       }
-
-      recorderRef.current?.setStream(stream);
-
-      // Check torch capabilities
-      const track = stream.getVideoTracks()[0];
-      const capabilities = track.getCapabilities?.() as { torch?: boolean } | undefined;
-      setTorchAvailable(!!capabilities?.torch);
-
-      // Enumerate camera devices
-      const allDevices = await navigator.mediaDevices.enumerateDevices();
-      const videoInputs = allDevices.filter((d) => d.kind === 'videoinput');
-      setDevices(videoInputs);
-
-      setCameraPermission('granted');
-    } catch (err) {
-      console.error('[CaptureStudio] Failed to access camera:', err);
-      setCameraPermission('denied');
+    } catch (err: unknown) {
+      const error = err as Error;
+      setCameraError(error.message);
     }
-  }, [selectedDeviceId, targetResolution]);
-
-  const stopCamera = () => {
-    cvEngineRef.current?.stop();
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
-  };
+  }, []);
 
   useEffect(() => {
-    initCamera();
-    return () => stopCamera();
-  }, [initCamera]);
-
-  // Toggle Torch/Flashlight
-  const toggleTorch = async () => {
-    if (!streamRef.current) return;
-    const track = streamRef.current.getVideoTracks()[0];
-    try {
-      const newState = !torchOn;
-      // @ts-expect-error torch constraint
-      await track.applyConstraints({ advanced: [{ torch: newState }] });
-      setTorchOn(newState);
-    } catch (err) {
-      console.warn('Torch constraint error:', err);
-    }
-  };
-
-  // Gyroscope / DeviceOrientation Tracking for Physical Orbit Angle
-  useEffect(() => {
-    let lastAlpha: number | null = null;
-    let accumulatedAngle = 0;
-
-    const handleOrientation = (e: DeviceOrientationEvent) => {
-      if (e.beta !== null) {
-        // Pitch elevation (degrees)
-        const elevation = Math.round(e.beta);
-        setOrbitState((prev) => ({
-          ...prev,
-          elevationAngle: elevation,
-          targetTier: elevation < 30 ? 'low' : elevation < 60 ? 'mid' : 'high',
-        }));
-      }
-
-      if (e.alpha !== null) {
-        if (lastAlpha !== null) {
-          let delta = e.alpha - lastAlpha;
-          // Handle 360 wrap-around
-          if (delta > 180) delta -= 360;
-          if (delta < -180) delta += 360;
-          accumulatedAngle += delta;
-
-          const angleNormalized = ((accumulatedAngle % 360) + 360) % 360;
-          const laps = Math.max(0, Math.floor(Math.abs(accumulatedAngle) / 360));
-          const progress = Math.min(100, Math.round((Math.abs(accumulatedAngle) / (orbitState.targetLaps * 360)) * 100));
-
-          setOrbitState((prev) => ({
-            ...prev,
-            currentAngle: Math.round(angleNormalized),
-            lapsCompleted: laps,
-            progressPercent: progress,
-          }));
-        }
-        lastAlpha = e.alpha;
-      }
-    };
-
-    if (typeof window !== 'undefined' && 'DeviceOrientationEvent' in window) {
-      window.addEventListener('deviceorientation', handleOrientation);
-    }
-
+    startLiveCamera();
     return () => {
-      window.removeEventListener('deviceorientation', handleOrientation);
+      CameraRecorderService.releaseStream(activeStreamRef.current);
+      if (localFileObjectUrlRef.current) {
+        URL.revokeObjectURL(localFileObjectUrlRef.current);
+      }
     };
-  }, [orbitState.targetLaps]);
+  }, [startLiveCamera]);
 
-  // Orbit Pacing Simulation / Timer Loop when recording
+  // Voice Guidance (SpeechSynthesis)
+  const triggerVoiceGuidance = useCallback(
+    (text: string) => {
+      if (!soundEnabled || typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+      const now = Date.now();
+      if (now - lastSpokenTimeRef.current < 4000) return;
+      if (lastSpokenTextRef.current === text && now - lastSpokenTimeRef.current < 8000) return;
+
+      lastSpokenTimeRef.current = now;
+      lastSpokenTextRef.current = text;
+
+      try {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.rate = 1.05;
+        utterance.volume = 0.85;
+        window.speechSynthesis.speak(utterance);
+      } catch {
+        // Speech API blocked or unavailable
+      }
+    },
+    [soundEnabled]
+  );
+
+  // 10 Hz Optical Telemetry Inspection Loop
   useEffect(() => {
-    if (!isRecording) return;
+    if (!cvCanvasRef.current) {
+      const canvas = document.createElement('canvas');
+      canvas.width = CV_CANVAS_WIDTH;
+      canvas.height = CV_CANVAS_HEIGHT;
+      cvCanvasRef.current = canvas;
+    }
 
-    const targetSec = scanPreset === 'single-30' ? 30 : scanPreset === 'double-60' ? 60 : 90;
-    const targetLaps = scanPreset === 'single-30' ? 1 : scanPreset === 'double-60' ? 2 : 3;
+    const intervalId = window.setInterval(() => {
+      if (!videoRef.current || !cvCanvasRef.current) return;
+      const tel = analyzeFrame(videoRef.current, cvCanvasRef.current);
+      setTelemetry(tel);
 
-    const interval = setInterval(() => {
-      setOrbitState((prev) => {
-        const elapsedSec = recordedDurationMs / 1000;
-        const progress = Math.min(100, (elapsedSec / targetSec) * 100);
-        const pacedAngle = (elapsedSec * (360 / (targetSec / targetLaps))) % 360;
+      if (isRecording) {
+        telemetryHistoryRef.current.push({
+          sharpness: tel.sharpnessScore,
+          texture: tel.textureScore,
+        });
 
-        // Auto stop on preset completion
-        if (progress >= 100 && scanPreset !== 'freeform') {
-          handleStopRecording();
+        if (tel.status !== 'OPTIMAL') {
+          triggerVoiceGuidance(tel.guidance);
         }
-
-        return {
-          ...prev,
-          targetAngle: Math.round(pacedAngle),
-          progressPercent: Math.round(progress),
-          targetLaps,
-        };
-      });
+      }
     }, 100);
 
-    return () => clearInterval(interval);
-  }, [isRecording, recordedDurationMs, scanPreset]);
+    return () => clearInterval(intervalId);
+  }, [isRecording, triggerVoiceGuidance]);
 
-  // Start 10 Mbps Video Capture
-  const handleStartRecording = () => {
-    if (!recorderRef.current) return;
-    telemetrySamplesRef.current = [];
-    const started = recorderRef.current.start();
+  // Handle Local Video File Upload (Testing fallback)
+  const handleLoadLocalVideo = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    CameraRecorderService.releaseStream(activeStreamRef.current);
+    activeStreamRef.current = null;
+    setCameraError(null);
+    setCameraMode('local_file');
+
+    if (localFileObjectUrlRef.current) {
+      URL.revokeObjectURL(localFileObjectUrlRef.current);
+    }
+
+    const url = URL.createObjectURL(file);
+    localFileObjectUrlRef.current = url;
+
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+      videoRef.current.src = url;
+      videoRef.current.loop = true;
+      videoRef.current.play().catch(() => {});
+    }
+  };
+
+  // Recording Controls
+  const handleStartCapture = () => {
+    telemetryHistoryRef.current = [];
+    setElapsedMs(0);
+    setCompletedResult(null);
+
+    const started = recorderServiceRef.current.startRecording((ms) => {
+      setElapsedMs(ms);
+      if (ms >= orbitDurationSec * 1000) {
+        handleStopCapture();
+      }
+    });
+
     if (started) {
       setIsRecording(true);
-      setCompletedCapture(null);
+      if (soundEnabled) {
+        triggerVoiceGuidance('RECORDING ENGAGED. MAINTAIN STEADY ORBIT.');
+      }
     }
   };
 
-  // Stop Capture & Package LOOM Manifest
-  const handleStopRecording = async () => {
-    if (!recorderRef.current || !recorderRef.current.isRecording()) return;
+  const handleStopCapture = async () => {
+    if (!recorderServiceRef.current.isRecording()) return;
     try {
-      const result = await recorderRef.current.stop();
+      const result = await recorderServiceRef.current.stopRecording();
       setIsRecording(false);
 
-      // Play success chime and celebration confetti
-      cvEngineRef.current?.playSuccessChime();
-      confetti({
-        particleCount: 80,
-        spread: 60,
-        origin: { y: 0.7 },
-        colors: ['#00e599', '#f59e0b', '#38bdf8'],
+      const history = telemetryHistoryRef.current;
+      const avgSharpness = history.length
+        ? Math.round(history.reduce((a, b) => a + b.sharpness, 0) / history.length)
+        : telemetry.sharpnessScore;
+      const avgTexture = history.length
+        ? Math.round(history.reduce((a, b) => a + b.texture, 0) / history.length)
+        : telemetry.textureScore;
+
+      const passed = avgSharpness >= 45 && result.durationSec >= 20;
+
+      const now = new Date();
+      const YYYY = now.getFullYear();
+      const MM = String(now.getMonth() + 1).padStart(2, '0');
+      const DD = String(now.getDate()).padStart(2, '0');
+      const HH = String(now.getHours()).padStart(2, '0');
+      const mm = String(now.getMinutes()).padStart(2, '0');
+      const timestampName = `loom_scan_${YYYY}${MM}${DD}_${HH}${mm}.${result.extension}`;
+
+      const previewUrl = URL.createObjectURL(result.blob);
+      setCompletedResult({
+        result,
+        url: previewUrl,
+        avgSharpness,
+        avgTexture,
+        passed,
+        timestampName,
       });
 
-      // Compute telemetry stats
-      const samples = telemetrySamplesRef.current;
-      const avgSharpness = samples.length ? Math.round(samples.reduce((a, b) => a + b.sharpness, 0) / samples.length) : metrics.sharpness;
-      const minSharpness = samples.length ? Math.round(Math.min(...samples.map((s) => s.sharpness))) : metrics.sharpness;
-      const avgTexture = samples.length ? Math.round(samples.reduce((a, b) => a + b.texture, 0) / samples.length) : metrics.textureDensity;
-      const maxGlare = samples.length ? Math.max(...samples.map((s) => s.glare)) : metrics.glarePercentage;
-
-      const metadata: CaptureMetadata = {
-        id: `cap_${Date.now()}`,
-        timestamp: new Date().toISOString(),
-        durationSeconds: result.durationSec,
-        resolution: {
-          width: videoRef.current?.videoWidth || 1920,
-          height: videoRef.current?.videoHeight || 1080,
-        },
-        fps: 60,
-        targetBitrateMbps: 10.0,
-        actualBitrateMbps: Math.round(((result.sizeBytes * 8) / (result.durationSec * 1_000_000)) * 10) / 10,
-        fileSizeBytes: result.sizeBytes,
-        mimeType: result.mimeType,
-        preset: scanPreset,
-        telemetrySummary: {
-          avgSharpness,
-          minSharpness,
-          avgTexture,
-          maxGlare,
-          blurFramePercentage: Math.round((samples.filter((s) => s.sharpness < 75).length / Math.max(1, samples.length)) * 100),
-          glareFramePercentage: Math.round((samples.filter((s) => s.glare > 3.0).length / Math.max(1, samples.length)) * 100),
-          orbitCoveragePercent: orbitState.progressPercent,
-          qualityRating: avgSharpness > 90 && maxGlare < 3.0 ? 'EXCELLENT' : 'GOOD',
-        },
-        deviceInfo: {
-          userAgent: navigator.userAgent,
-          cameraLabel: devices.find((d) => d.deviceId === selectedDeviceId)?.label || 'Primary Camera',
-          hasGyro: 'DeviceOrientationEvent' in window,
-        },
-        samples,
-      };
-
-      setCompletedCapture({
-        metadata,
-        videoBlob: result.blob,
-        videoUrl: result.url,
-      });
+      if (soundEnabled) {
+        triggerVoiceGuidance(passed ? 'OPTICAL AUDIT PASS' : 'OPTICAL AUDIT FAILED. RETAKE REQUIRED.');
+      }
     } catch (err) {
-      console.error('Stop recording error:', err);
+      console.error('[CaptureStudio] Stop capture error:', err);
     }
   };
 
-  // Format milliseconds to MM:SS.S
-  const formatTime = (ms: number) => {
-    const totalSec = ms / 1000;
-    const minutes = Math.floor(totalSec / 60);
-    const seconds = Math.floor(totalSec % 60);
-    const tenths = Math.floor((ms % 1000) / 100);
-    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${tenths}`;
+  // Download Recorded Video
+  const handleDownload = () => {
+    if (!completedResult) return;
+    const a = document.createElement('a');
+    a.href = completedResult.url;
+    a.download = completedResult.timestampName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   };
 
+  // Copy CLI Handoff Command
+  const cliCommand = `.venv/bin/python scripts/demo.py --video ~/Downloads/${
+    completedResult?.timestampName || 'loom_scan.mp4'
+  } --turbo --target-length ${targetPrintLengthMm.toFixed(1)} --export-stl`;
+
+  const handleCopyCli = () => {
+    navigator.clipboard.writeText(cliCommand);
+    setCopiedCli(true);
+    setTimeout(() => setCopiedCli(false), 2000);
+  };
+
+  // Orbit ring calculations
+  const orbitProgress = Math.min(100, Math.round((elapsedMs / (orbitDurationSec * 1000)) * 100));
+  const activeSector = Math.floor((orbitProgress / 100) * 12);
+
   return (
-    <div className="relative w-full h-[calc(100vh-4rem)] bg-[#090b0e] flex flex-col overflow-hidden">
-      {/* Live Viewport Area */}
-      <div className="relative flex-1 w-full bg-[#090b0e] flex items-center justify-center overflow-hidden">
-        {/* Mandated playsInline, muted, autoPlay for seamless iOS Safari & Chrome playback */}
+    <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] h-[calc(100vh-48px)] bg-[#0C0D0F] select-none overflow-hidden">
+      {/* LEFT OPTICAL VIEWPORT */}
+      <div className="bg-[#08090A] relative flex items-center justify-center overflow-hidden border-b lg:border-b-0 border-[#262930]">
+        {/* Mandated playsInline, muted, autoPlay */}
         <video
           ref={videoRef}
           playsInline
@@ -392,411 +286,402 @@ export const CaptureStudio: React.FC<CaptureStudioProps> = ({
           className="w-full h-full object-cover select-none pointer-events-none"
         />
 
-        {/* Camera Permission Overlay */}
-        {cameraPermission !== 'granted' && (
-          <div className="absolute inset-0 bg-[#090b0e]/95 flex flex-col items-center justify-center p-6 text-center z-30">
-            <div className="w-16 h-16 rounded-2xl bg-[#12161f] border border-[#1e2430] flex items-center justify-center mb-4">
-              <Camera className="w-8 h-8 text-[#00e599]" />
+        {/* Top-Left Mode & Local Video Loader */}
+        <div className="absolute top-3 left-3 z-20 flex items-center gap-2">
+          <label className="border border-[#262930] bg-[#131518] hover:bg-[#1A1D21] text-[#ECEEF2] text-xs font-mono px-2.5 py-1.5 rounded flex items-center gap-1.5 cursor-pointer transition">
+            <Upload className="w-3.5 h-3.5 text-[#8A909E]" />
+            <span>{cameraMode === 'local_file' ? 'FILE LOADED' : 'LOAD LOCAL VIDEO'}</span>
+            <input
+              type="file"
+              accept="video/mp4,video/webm"
+              onChange={handleLoadLocalVideo}
+              className="hidden"
+            />
+          </label>
+
+          {cameraMode === 'local_file' && (
+            <button
+              onClick={startLiveCamera}
+              className="border border-[#262930] bg-[#131518] hover:bg-[#1A1D21] text-[#8A909E] hover:text-[#ECEEF2] text-xs font-mono px-2 py-1.5 rounded flex items-center gap-1 transition"
+            >
+              <RotateCcw className="w-3 h-3" />
+              <span>LIVE CAM</span>
+            </button>
+          )}
+        </div>
+
+        {/* Camera Permission / Error Fallback */}
+        {cameraError && cameraMode === 'live' && (
+          <div className="absolute inset-0 bg-[#0C0D0F]/95 z-30 flex flex-col items-center justify-center p-6 text-center">
+            <div className="w-12 h-12 rounded border border-[#EF4444] bg-[#131518] flex items-center justify-center mb-3">
+              <AlertTriangle className="w-6 h-6 text-[#EF4444]" />
             </div>
-            <h2 className="text-lg font-bold text-[#f1f5f9] mb-2">Enable Camera to Begin 3D Photogrammetry</h2>
-            <p className="text-xs text-[#94a3b8] max-w-md mb-6 leading-relaxed">
-              LOOM Capture Studio uses real-time computer vision at 10 Hz to guide your orbit cadence and capture high-fidelity 10 Mbps scans.
+            <div className="font-mono text-xs uppercase tracking-wider text-[#EF4444] font-medium mb-1">
+              OPTICAL SENSOR FAULT
+            </div>
+            <p className="text-xs font-mono text-[#8A909E] max-w-sm mb-5 leading-relaxed">
+              {cameraError}
             </p>
-            <div className="flex gap-3">
+            <div className="flex gap-2">
               <button
-                onClick={initCamera}
-                className="px-5 py-2.5 rounded-lg bg-[#00e599] text-[#090b0e] font-semibold text-xs hover:bg-[#00e599]/90 transition"
+                onClick={startLiveCamera}
+                className="border border-[#262930] bg-[#ECEEF2] text-[#0C0D0F] hover:bg-[#FFFFFF] text-xs font-mono px-4 py-2 rounded font-medium transition"
               >
-                Allow Camera Access
-              </button>
-              <button
-                onClick={onOpenQrModal}
-                className="px-4 py-2.5 rounded-lg bg-[#12161f] border border-[#1e2430] text-[#f1f5f9] font-medium text-xs hover:bg-[#1e2430] transition flex items-center gap-2"
-              >
-                <QrCode className="w-3.5 h-3.5 text-[#00e599]" />
-                Pair Smartphone
+                RE-INITIALIZE
               </button>
             </div>
           </div>
         )}
 
-        {/* Computer Vision AR Crosshairs & Bounding Target Reticle */}
-        <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
-          <div className="relative w-64 h-64 md:w-80 md:h-80 border border-[#00e599]/20 rounded-2xl transition-all duration-300">
-            {/* 4 Corner Targeting Brackets */}
-            <div className="absolute -top-1 -left-1 w-6 h-6 border-t-2 border-l-2 border-[#00e599]" />
-            <div className="absolute -top-1 -right-1 w-6 h-6 border-t-2 border-r-2 border-[#00e599]" />
-            <div className="absolute -bottom-1 -left-1 w-6 h-6 border-b-2 border-l-2 border-[#00e599]" />
-            <div className="absolute -bottom-1 -right-1 w-6 h-6 border-b-2 border-r-2 border-[#00e599]" />
+        {/* MINIMALIST SVG OPTICAL RETICLE */}
+        <svg
+          className="absolute inset-0 w-full h-full pointer-events-none"
+          viewBox="0 0 1000 1000"
+          preserveAspectRatio="xMidYMid meet"
+        >
+          {/* Thin 1px Center Crosshair */}
+          <g stroke="#8A909E" strokeWidth="1" opacity="0.45">
+            <line x1="480" y1="500" x2="520" y2="500" />
+            <line x1="500" y1="480" x2="500" y2="520" />
+            <circle cx="500" cy="500" r="3" fill="none" />
+          </g>
 
-            {/* Center Crosshairs */}
-            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-4 h-[1px] bg-[#00e599]/50" />
-            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[1px] h-4 bg-[#00e599]/50" />
-            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-[#00e599]" />
-
-            {/* Dynamic Target Elevation Indicator */}
-            <div className="absolute bottom-2 left-1/2 -translate-x-1/2 text-[10px] font-mono text-[#94a3b8] px-2 py-0.5 rounded bg-[#12161f]/80 backdrop-blur-sm border border-[#1e2430]">
-              TILT: <span className="text-[#00e599] font-bold">{orbitState.elevationAngle}°</span> ({orbitState.targetTier.toUpperCase()} TIER)
-            </div>
-          </div>
-        </div>
-
-        {/* Top Floating Status Coach Banner */}
-        <div className="absolute top-4 inset-x-4 md:inset-x-auto md:left-1/2 md:-translate-x-1/2 z-20 flex flex-col items-center pointer-events-none">
-          <div
-            className={`flex items-center gap-2.5 px-4 py-2 rounded-full border backdrop-blur-md shadow-xl transition-all duration-300 ${
-              metrics.overallStatus === 'optimal'
-                ? 'bg-[#12161f]/90 border-[#00e599]/40 text-[#00e599]'
-                : metrics.overallStatus === 'warning'
-                ? 'bg-[#12161f]/90 border-[#f59e0b]/50 text-[#f59e0b]'
-                : 'bg-[#12161f]/90 border-[#ff4d4d]/60 text-[#ff4d4d]'
-            }`}
+          {/* 60% Framing Corner Brackets (Bounds: 200, 200 to 800, 800) */}
+          <g
+            stroke={telemetry.statusColor}
+            strokeWidth="2"
+            fill="none"
+            strokeLinecap="square"
+            className="transition-colors duration-200"
           >
-            {metrics.overallStatus === 'optimal' ? (
-              <CheckCircle2 className="w-4 h-4 text-[#00e599]" />
-            ) : (
-              <AlertTriangle className="w-4 h-4 animate-pulse" />
-            )}
-            <span className="text-xs font-semibold tracking-wide">
-              {metrics.statusMessage}
-            </span>
-          </div>
-        </div>
+            {/* Top-Left */}
+            <path d="M 240 200 L 200 200 L 200 240" />
+            {/* Top-Right */}
+            <path d="M 760 200 L 800 200 L 800 240" />
+            {/* Bottom-Left */}
+            <path d="M 240 800 L 200 800 L 200 760" />
+            {/* Bottom-Right */}
+            <path d="M 760 800 L 800 800 L 800 760" />
+          </g>
 
-        {/* Top-Right Quick Controls */}
-        <div className="absolute top-4 right-4 z-20 flex items-center gap-2">
-          {torchAvailable && (
-            <button
-              onClick={toggleTorch}
-              className={`p-2.5 rounded-lg border backdrop-blur-md transition ${
-                torchOn
-                  ? 'bg-[#00e599] text-[#090b0e] border-[#00e599]'
-                  : 'bg-[#12161f]/90 border-[#1e2430] text-[#94a3b8] hover:text-[#f1f5f9]'
-              }`}
-              title="Toggle Flashlight / Fill Light"
-            >
-              <Zap className="w-4 h-4" />
-            </button>
-          )}
+          {/* Thin 2px Circular 12-Sector Orbit Progress Ring (Radius: 430, Center: 500, 500) */}
+          <g>
+            {Array.from({ length: 12 }).map((_, idx) => {
+              const startAngleDeg = idx * 30 - 90;
+              const isFilled = idx <= activeSector && isRecording;
 
-          <button
-            onClick={() => setSoundEnabled(!soundEnabled)}
-            className="p-2.5 rounded-lg bg-[#12161f]/90 backdrop-blur-md border border-[#1e2430] text-[#94a3b8] hover:text-[#f1f5f9] transition"
-            title="Audio Feedback Toggle"
-          >
-            {soundEnabled ? <Volume2 className="w-4 h-4 text-[#00e599]" /> : <VolumeX className="w-4 h-4" />}
-          </button>
+              const r = 430;
+              const radStart = ((startAngleDeg + 3) * Math.PI) / 180;
+              const radEnd = ((startAngleDeg + 27) * Math.PI) / 180;
+              const x1 = 500 + r * Math.cos(radStart);
+              const y1 = 500 + r * Math.sin(radStart);
+              const x2 = 500 + r * Math.cos(radEnd);
+              const y2 = 500 + r * Math.sin(radEnd);
 
-          <button
-            onClick={onOpenGuideModal}
-            className="p-2.5 rounded-lg bg-[#12161f]/90 backdrop-blur-md border border-[#1e2430] text-[#94a3b8] hover:text-[#00e599] transition"
-            title="Photogrammetry Best Practices"
-          >
-            <Info className="w-4 h-4" />
-          </button>
-        </div>
+              return (
+                <path
+                  key={idx}
+                  d={`M ${x1} ${y1} A ${r} ${r} 0 0 1 ${x2} ${y2}`}
+                  fill="none"
+                  stroke={isFilled ? '#10B981' : '#262930'}
+                  strokeWidth="2"
+                  strokeLinecap="square"
+                  className="transition-colors duration-200"
+                />
+              );
+            })}
+          </g>
+        </svg>
 
-        {/* 360° Orbital Compass & Cadence Pacer (Floating Left) */}
-        <div className="absolute left-4 top-20 z-20 hidden sm:flex flex-col items-center bg-[#12161f]/90 backdrop-blur-md border border-[#1e2430] p-3 rounded-xl">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-[#94a3b8] mb-1">Orbit Pacer</span>
-          <div className="relative w-20 h-20 flex items-center justify-center">
-            {/* Circular Orbit Track */}
-            <svg className="w-full h-full -rotate-90 transform" viewBox="0 0 100 100">
-              <circle
-                cx="50"
-                cy="50"
-                r="42"
-                fill="none"
-                stroke="#1e2430"
-                strokeWidth="6"
-              />
-              <circle
-                cx="50"
-                cy="50"
-                r="42"
-                fill="none"
-                stroke="#00e599"
-                strokeWidth="6"
-                strokeDasharray="264"
-                strokeDashoffset={264 - (264 * orbitState.progressPercent) / 100}
-                strokeLinecap="round"
-                className="transition-all duration-200"
-              />
-            </svg>
-
-            {/* Current Camera Angle Needle */}
-            <div
-              className="absolute w-1.5 h-6 bg-[#00e599] rounded-full origin-bottom -translate-y-3 transition-transform duration-150"
-              style={{ transform: `rotate(${orbitState.currentAngle}deg)` }}
+        {/* Viewport Bottom Status Bar: Exact Coaching Output */}
+        <div className="absolute bottom-3 inset-x-3 z-20 flex justify-center pointer-events-none">
+          <div className="bg-[#131518] border border-[#262930] px-3.5 py-1.5 rounded flex items-center gap-2.5 font-mono text-xs text-[#ECEEF2]">
+            <span
+              className="w-2 h-2 rounded-full"
+              style={{ backgroundColor: telemetry.statusColor }}
             />
-
-            {/* Inner Readout */}
-            <div className="absolute text-center">
-              <span className="text-xs font-mono font-bold text-[#f1f5f9] tabular-nums">
-                {orbitState.progressPercent}%
-              </span>
-            </div>
-          </div>
-          <span className="text-[9px] font-mono text-[#94a3b8] mt-1 tabular-nums">
-            {orbitState.currentAngle}° / 360°
-          </span>
-        </div>
-
-        {/* Live Bottom Telemetry HUD Bar */}
-        <div className="absolute bottom-4 inset-x-4 z-20 max-w-4xl mx-auto bg-[#12161f]/95 backdrop-blur-md border border-[#1e2430] rounded-xl p-3 flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
-          {/* Sharpness (Laplacian Variance) */}
-          <div className="flex-1 min-w-[120px]">
-            <div className="flex justify-between text-[10px] text-[#94a3b8] mb-1">
-              <span>SHARPNESS</span>
-              <span className={`font-semibold tabular-nums ${metrics.sharpness > 75 ? 'text-[#00e599]' : 'text-[#f59e0b]'}`}>
-                {metrics.sharpness} var
-              </span>
-            </div>
-            <div className="w-full h-1.5 bg-[#090b0e] rounded-full overflow-hidden">
-              <div
-                className={`h-full transition-all duration-200 ${metrics.sharpness > 75 ? 'bg-[#00e599]' : 'bg-[#f59e0b]'}`}
-                style={{ width: `${Math.min(100, (metrics.sharpness / 200) * 100)}%` }}
-              />
-            </div>
-          </div>
-
-          {/* Texture Density */}
-          <div className="flex-1 min-w-[120px]">
-            <div className="flex justify-between text-[10px] text-[#94a3b8] mb-1">
-              <span>TEXTURE DENSITY</span>
-              <span className={`font-semibold tabular-nums ${metrics.textureDensity > 12 ? 'text-[#00e599]' : 'text-[#f59e0b]'}`}>
-                {metrics.textureDensity}%
-              </span>
-            </div>
-            <div className="w-full h-1.5 bg-[#090b0e] rounded-full overflow-hidden">
-              <div
-                className={`h-full transition-all duration-200 ${metrics.textureDensity > 12 ? 'bg-[#00e599]' : 'bg-[#f59e0b]'}`}
-                style={{ width: `${metrics.textureDensity}%` }}
-              />
-            </div>
-          </div>
-
-          {/* Glare Saturation */}
-          <div className="flex-1 min-w-[120px]">
-            <div className="flex justify-between text-[10px] text-[#94a3b8] mb-1">
-              <span>SPECULAR GLARE</span>
-              <span className={`font-semibold tabular-nums ${metrics.glarePercentage < 3.0 ? 'text-[#00e599]' : 'text-[#ff4d4d]'}`}>
-                {metrics.glarePercentage}%
-              </span>
-            </div>
-            <div className="w-full h-1.5 bg-[#090b0e] rounded-full overflow-hidden">
-              <div
-                className={`h-full transition-all duration-200 ${metrics.glarePercentage < 3.0 ? 'bg-[#00e599]' : 'bg-[#ff4d4d]'}`}
-                style={{ width: `${Math.min(100, (metrics.glarePercentage / 10) * 100)}%` }}
-              />
-            </div>
-          </div>
-
-          {/* Capture Telemetry Badges */}
-          <div className="flex items-center gap-2 border-l border-[#1e2430] pl-3">
-            <div className="text-right">
-              <span className="text-[10px] text-[#94a3b8] block">BITRATE</span>
-              <span className="text-[#00e599] font-bold tabular-nums">
-                {isRecording ? `${currentBitrateMbps || 10.0} Mbps` : '10.0 Mbps'}
-              </span>
-            </div>
-            {isRecording && (
-              <div className="text-right">
-                <span className="text-[10px] text-[#94a3b8] block">SIZE</span>
-                <span className="text-[#f1f5f9] font-bold tabular-nums">
-                  {(recordedBytes / 1_048_576).toFixed(1)} MB
-                </span>
-              </div>
-            )}
-            <div className="text-right">
-              <span className="text-[10px] text-[#94a3b8] block">TARGET FPS</span>
-              <span className="text-[#f1f5f9] font-bold tabular-nums">60 fps</span>
-            </div>
+            <span className="font-medium tracking-tight">[{telemetry.code}]</span>
+            <span className="text-[#8A909E]">—</span>
+            <span className="tracking-tight text-[#ECEEF2]">{telemetry.guidance}</span>
           </div>
         </div>
       </div>
 
-      {/* Bottom Main Action & Capture Control Deck */}
-      <div className="bg-[#12161f] border-t border-[#1e2430] p-4 flex flex-col sm:flex-row items-center justify-between gap-4 z-20">
-        {/* Preset & Device Selectors */}
-        <div className="flex items-center gap-2 w-full sm:w-auto">
-          <span className="text-xs font-mono text-[#94a3b8] hidden md:inline">PRESET:</span>
-          <select
-            value={scanPreset}
-            disabled={isRecording}
-            onChange={(e) => setScanPreset(e.target.value as ScanPreset)}
-            className="bg-[#090b0e] border border-[#1e2430] rounded-lg px-3 py-2 text-xs font-mono text-[#f1f5f9] focus:outline-none focus:border-[#00e599] transition disabled:opacity-50"
-          >
-            <option value="single-30">Single Orbit (30s — Standard)</option>
-            <option value="double-60">Double Orbit (60s — Multi-tier)</option>
-            <option value="spiral-90">Spiral Orbit (90s — High-Detail)</option>
-            <option value="freeform">Freeform (Manual Stop)</option>
-          </select>
+      {/* RIGHT TELEMETRY & CONTROL RAIL */}
+      <div className="bg-[#131518] border-l border-[#262930] flex flex-col justify-between p-4 overflow-y-auto font-mono text-xs gap-5">
+        <div className="flex flex-col gap-5">
+          {/* Section A — Acquisition Protocol */}
+          <div className="border border-[#262930] rounded-md p-3 bg-[#0C0D0F]">
+            <div className="flex items-center justify-between pb-2 mb-2 border-b border-[#262930]">
+              <span className="text-[11px] text-[#8A909E] uppercase tracking-wider font-semibold">
+                SEC_A // ACQUISITION PROTOCOL
+              </span>
+              <span className="text-[10px] text-[#8A909E]">3 CHECKS</span>
+            </div>
+            <div className="space-y-2">
+              <label className="flex items-start gap-2 cursor-pointer text-[#ECEEF2] hover:text-[#FFFFFF] transition">
+                <input
+                  type="checkbox"
+                  checked={checklist.baseplate}
+                  onChange={(e) => setChecklist({ ...checklist, baseplate: e.target.checked })}
+                  className="accent-[#10B981] w-3.5 h-3.5 mt-0.5 rounded cursor-pointer"
+                />
+                <span className={checklist.baseplate ? 'text-[#ECEEF2]' : 'text-[#8A909E]'}>
+                  Textured baseplate placed under subject
+                </span>
+              </label>
 
-          {/* Resolution select */}
-          <select
-            value={targetResolution}
-            disabled={isRecording}
-            onChange={(e) => setTargetResolution(e.target.value as '1080p' | '4k' | '720p')}
-            className="bg-[#090b0e] border border-[#1e2430] rounded-lg px-2.5 py-2 text-xs font-mono text-[#94a3b8] focus:outline-none focus:border-[#00e599] transition disabled:opacity-50"
-          >
-            <option value="1080p">1080p</option>
-            <option value="4k">4K UHD</option>
-            <option value="720p">720p</option>
-          </select>
+              <label className="flex items-start gap-2 cursor-pointer text-[#ECEEF2] hover:text-[#FFFFFF] transition">
+                <input
+                  type="checkbox"
+                  checked={checklist.cavities}
+                  onChange={(e) => setChecklist({ ...checklist, cavities: e.target.checked })}
+                  className="accent-[#10B981] w-3.5 h-3.5 mt-0.5 rounded cursor-pointer"
+                />
+                <span className={checklist.cavities ? 'text-[#ECEEF2]' : 'text-[#8A909E]'}>
+                  Hollow cavities filled / rigid silhouette
+                </span>
+              </label>
 
-          {/* Camera switcher if multiple sensors detected */}
-          {devices.length > 1 && (
-            <select
-              value={selectedDeviceId}
-              disabled={isRecording}
-              onChange={(e) => setSelectedDeviceId(e.target.value)}
-              className="bg-[#090b0e] border border-[#1e2430] rounded-lg px-2.5 py-2 text-xs font-mono text-[#94a3b8] focus:outline-none focus:border-[#00e599] transition disabled:opacity-50 max-w-[130px] truncate"
-            >
-              <option value="">Auto Camera</option>
-              {devices.map((d, i) => (
-                <option key={d.deviceId || i} value={d.deviceId}>
-                  {d.label || `Camera ${i + 1}`}
-                </option>
-              ))}
-            </select>
-          )}
+              <label className="flex items-start gap-2 cursor-pointer text-[#ECEEF2] hover:text-[#FFFFFF] transition">
+                <input
+                  type="checkbox"
+                  checked={checklist.cameraAngle}
+                  onChange={(e) => setChecklist({ ...checklist, cameraAngle: e.target.checked })}
+                  className="accent-[#10B981] w-3.5 h-3.5 mt-0.5 rounded cursor-pointer"
+                />
+                <span className={checklist.cameraAngle ? 'text-[#ECEEF2]' : 'text-[#8A909E]'}>
+                  Fixed zoom & 35°–45° downward elevation
+                </span>
+              </label>
+            </div>
+          </div>
+
+          {/* Section B — Live 10 Hz Optical Telemetry */}
+          <div className="border border-[#262930] rounded-md p-3 bg-[#0C0D0F]">
+            <div className="flex items-center justify-between pb-2 mb-3 border-b border-[#262930]">
+              <span className="text-[11px] text-[#8A909E] uppercase tracking-wider font-semibold">
+                SEC_B // OPTICAL TELEMETRY (10 Hz)
+              </span>
+              <span
+                className="text-[10px] px-1.5 py-0.2 rounded border uppercase font-medium"
+                style={{
+                  borderColor: `${telemetry.statusColor}40`,
+                  color: telemetry.statusColor,
+                  backgroundColor: `${telemetry.statusColor}10`,
+                }}
+              >
+                {telemetry.status}
+              </span>
+            </div>
+
+            {/* Sharpness (Laplacian) */}
+            <div className="mb-3">
+              <div className="flex justify-between text-[11px] mb-1">
+                <span className="text-[#8A909E]">SHARPNESS (LAPLACIAN)</span>
+                <span className="text-[#ECEEF2] font-semibold tabular-nums">
+                  {telemetry.sharpnessScore} <span className="text-[#8A909E]">/ 100</span>
+                </span>
+              </div>
+              <div className="w-full h-1 bg-[#1A1D21] rounded overflow-hidden">
+                <div
+                  className="h-full transition-all duration-150"
+                  style={{
+                    width: `${telemetry.sharpnessScore}%`,
+                    backgroundColor: telemetry.sharpnessScore >= 50 ? '#10B981' : '#EF4444',
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* Texture (Sobel) */}
+            <div className="mb-3">
+              <div className="flex justify-between text-[11px] mb-1">
+                <span className="text-[#8A909E]">TEXTURE (SOBEL)</span>
+                <span className="text-[#ECEEF2] font-semibold tabular-nums">
+                  {telemetry.textureScore} <span className="text-[#8A909E]">/ 100</span>
+                </span>
+              </div>
+              <div className="w-full h-1 bg-[#1A1D21] rounded overflow-hidden">
+                <div
+                  className="h-full transition-all duration-150"
+                  style={{
+                    width: `${telemetry.textureScore}%`,
+                    backgroundColor: telemetry.textureScore >= 22 ? '#10B981' : '#F59E0B',
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* Glare Ratio */}
+            <div className="flex justify-between items-center text-[11px]">
+              <span className="text-[#8A909E]">GLARE RATIO</span>
+              <span
+                className={`font-semibold tabular-nums ${
+                  telemetry.overexposedRatio > 0.18 ? 'text-[#EF4444]' : 'text-[#ECEEF2]'
+                }`}
+              >
+                {(telemetry.overexposedRatio * 100).toFixed(1)}%
+              </span>
+            </div>
+          </div>
+
+          {/* Section C — Scan Parameters & Controls */}
+          <div className="border border-[#262930] rounded-md p-3 bg-[#0C0D0F]">
+            <div className="pb-2 mb-3 border-b border-[#262930] flex items-center justify-between">
+              <span className="text-[11px] text-[#8A909E] uppercase tracking-wider font-semibold">
+                SEC_C // SCAN PARAMETERS
+              </span>
+              <button
+                onClick={() => setSoundEnabled(!soundEnabled)}
+                className="text-[#8A909E] hover:text-[#ECEEF2] transition"
+                title={soundEnabled ? 'Voice Guidance On' : 'Voice Guidance Muted'}
+              >
+                {soundEnabled ? <Volume2 className="w-3.5 h-3.5 text-[#10B981]" /> : <VolumeX className="w-3.5 h-3.5" />}
+              </button>
+            </div>
+
+            {/* Orbit Target duration toggle */}
+            <div className="mb-3">
+              <span className="text-[10px] text-[#8A909E] uppercase block mb-1.5">ORBIT TARGET</span>
+              <div className="grid grid-cols-2 gap-1.5 bg-[#131518] p-1 border border-[#262930] rounded">
+                <button
+                  type="button"
+                  disabled={isRecording}
+                  onClick={() => setOrbitDurationSec(45)}
+                  className={`py-1 rounded text-center transition ${
+                    orbitDurationSec === 45
+                      ? 'bg-[#1A1D21] text-[#ECEEF2] border border-[#262930] font-medium'
+                      : 'text-[#8A909E] hover:text-[#ECEEF2]'
+                  }`}
+                >
+                  45s (68 FRAMES)
+                </button>
+                <button
+                  type="button"
+                  disabled={isRecording}
+                  onClick={() => setOrbitDurationSec(60)}
+                  className={`py-1 rounded text-center transition ${
+                    orbitDurationSec === 60
+                      ? 'bg-[#1A1D21] text-[#ECEEF2] border border-[#262930] font-medium'
+                      : 'text-[#8A909E] hover:text-[#ECEEF2]'
+                  }`}
+                >
+                  60s (90 FRAMES)
+                </button>
+              </div>
+            </div>
+
+            {/* Target Print Length */}
+            <div>
+              <span className="text-[10px] text-[#8A909E] uppercase block mb-1.5">
+                TARGET PRINT LENGTH (METRIC CALIBRATION)
+              </span>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min="10"
+                  max="1000"
+                  step="1"
+                  value={targetPrintLengthMm}
+                  onChange={(e) => setTargetPrintLengthMm(Number(e.target.value) || 200)}
+                  disabled={isRecording}
+                  className="flex-1 bg-[#131518] border border-[#262930] focus:border-[#ECEEF2] outline-none text-[#ECEEF2] px-2.5 py-1.5 rounded tabular-nums"
+                />
+                <span className="text-[#8A909E] font-mono text-xs">mm</span>
+              </div>
+            </div>
+          </div>
         </div>
 
-        {/* Big Capture Trigger Button */}
-        <div className="flex items-center gap-4">
+        {/* Bottom Trigger & Post-Capture Section */}
+        <div className="flex flex-col gap-3">
+          {/* Active Recording / Start Button */}
           {isRecording ? (
             <button
-              onClick={handleStopRecording}
-              className="flex items-center gap-3 px-6 py-3 rounded-full bg-[#ff4d4d] hover:bg-[#ff4d4d]/90 text-white font-bold text-sm tracking-wide shadow-lg shadow-[#ff4d4d]/20 transition animate-pulse"
+              onClick={handleStopCapture}
+              className="w-full py-2.5 rounded bg-[#F97316] hover:bg-[#EA580C] text-[#0C0D0F] font-mono font-bold tracking-wider text-xs transition"
             >
-              <Square className="w-4 h-4 fill-white" />
-              <span>COMPLETE SCAN ({formatTime(recordedDurationMs)})</span>
+              STOP CAPTURE ({Math.floor(elapsedMs / 1000)}s / {orbitDurationSec}s)
             </button>
           ) : (
             <button
-              onClick={handleStartRecording}
-              disabled={cameraPermission !== 'granted'}
-              className="flex items-center gap-3 px-7 py-3 rounded-full bg-[#00e599] hover:bg-[#00e599]/90 text-[#090b0e] font-bold text-sm tracking-wide shadow-lg shadow-[#00e599]/20 transition disabled:opacity-50 disabled:cursor-not-allowed"
+              onClick={handleStartCapture}
+              className="w-full py-2.5 rounded bg-[#ECEEF2] hover:bg-[#FFFFFF] text-[#0C0D0F] font-mono font-medium tracking-wider text-xs transition"
             >
-              <Play className="w-4 h-4 fill-[#090b0e]" />
-              <span>START 10 MBPS CAPTURE</span>
+              START CAPTURE (10 Mbps)
             </button>
           )}
-        </div>
 
-        {/* Quick Links */}
-        <div className="flex items-center gap-2">
-          <button
-            onClick={onOpenInspector}
-            className="px-3 py-2 rounded-lg bg-[#090b0e] border border-[#1e2430] hover:border-[#00e599]/40 text-xs text-[#94a3b8] hover:text-[#f1f5f9] transition flex items-center gap-1.5 font-mono"
-          >
-            <span>3D STL View</span>
-            <ChevronRight className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={onOpenLoomBridge}
-            className="px-3 py-2 rounded-lg bg-[#090b0e] border border-[#1e2430] hover:border-[#00e599]/40 text-xs text-[#94a3b8] hover:text-[#00e599] transition flex items-center gap-1.5 font-mono"
-          >
-            <span>LOOM Hub</span>
-            <ChevronRight className="w-3.5 h-3.5" />
-          </button>
-        </div>
-      </div>
-
-      {/* Capture Review Modal */}
-      {completedCapture && (
-        <div className="fixed inset-0 z-50 bg-[#090b0e]/90 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="w-full max-w-xl bg-[#12161f] border border-[#1e2430] rounded-2xl p-6 shadow-2xl flex flex-col gap-5">
-            <div className="flex items-center justify-between border-b border-[#1e2430] pb-3">
-              <div>
-                <span className="text-[10px] font-mono uppercase tracking-wider text-[#00e599]">Capture Success</span>
-                <h3 className="text-lg font-bold text-[#f1f5f9]">Photogrammetry Scan Audit</h3>
-              </div>
-              <span className="px-3 py-1 rounded-full bg-[#00e599]/10 text-[#00e599] border border-[#00e599]/20 text-xs font-mono font-bold">
-                {completedCapture.metadata.telemetrySummary.qualityRating}
-              </span>
-            </div>
-
-            {/* Video Preview */}
-            <div className="relative rounded-lg overflow-hidden border border-[#1e2430] bg-[#090b0e] aspect-video">
-              <video
-                src={completedCapture.videoUrl}
-                controls
-                playsInline
-                className="w-full h-full object-contain"
-              />
-            </div>
-
-            {/* Telemetry Summary Grid */}
-            <div className="grid grid-cols-3 gap-2.5 text-xs font-mono">
-              <div className="bg-[#090b0e] p-2.5 rounded border border-[#1e2430]">
-                <span className="text-[#94a3b8] text-[10px] block">Duration</span>
-                <span className="text-[#f1f5f9] font-medium">{completedCapture.metadata.durationSeconds}s</span>
-              </div>
-              <div className="bg-[#090b0e] p-2.5 rounded border border-[#1e2430]">
-                <span className="text-[#94a3b8] text-[10px] block">Avg Sharpness</span>
-                <span className="text-[#00e599] font-medium">{completedCapture.metadata.telemetrySummary.avgSharpness} var</span>
-              </div>
-              <div className="bg-[#090b0e] p-2.5 rounded border border-[#1e2430]">
-                <span className="text-[#94a3b8] text-[10px] block">Bitrate</span>
-                <span className="text-[#f1f5f9] font-medium">{completedCapture.metadata.actualBitrateMbps} Mbps</span>
-              </div>
-              <div className="bg-[#090b0e] p-2.5 rounded border border-[#1e2430]">
-                <span className="text-[#94a3b8] text-[10px] block">File Size</span>
-                <span className="text-[#f1f5f9] font-medium">
-                  {Math.round((completedCapture.metadata.fileSizeBytes / 1_048_576) * 10) / 10} MB
+          {/* Section D — Post-Capture Export Card */}
+          {completedResult && (
+            <div className="border border-[#262930] rounded-md p-3 bg-[#0C0D0F] flex flex-col gap-3">
+              <div className="flex items-center justify-between pb-2 border-b border-[#262930]">
+                <span className="text-[11px] text-[#8A909E] uppercase font-semibold">
+                  SEC_D // ACQUISITION AUDIT
+                </span>
+                <span
+                  className={`text-[10px] px-2 py-0.5 rounded font-bold uppercase border ${
+                    completedResult.passed
+                      ? 'border-[#10B981]/40 text-[#10B981] bg-[#10B981]/10'
+                      : 'border-[#EF4444]/40 text-[#EF4444] bg-[#EF4444]/10'
+                  }`}
+                >
+                  {completedResult.passed ? 'PASS (READY)' : 'RETAKE REQUIRED'}
                 </span>
               </div>
-              <div className="bg-[#090b0e] p-2.5 rounded border border-[#1e2430]">
-                <span className="text-[#94a3b8] text-[10px] block">Orbit Coverage</span>
-                <span className="text-[#00e599] font-medium">{completedCapture.metadata.telemetrySummary.orbitCoveragePercent}%</span>
+
+              {/* Metrics */}
+              <div className="grid grid-cols-3 gap-1.5 text-center text-[10px]">
+                <div className="p-1.5 border border-[#262930] rounded bg-[#131518]">
+                  <span className="text-[#8A909E] block">DURATION</span>
+                  <span className="text-[#ECEEF2] font-semibold">{completedResult.result.durationSec}s</span>
+                </div>
+                <div className="p-1.5 border border-[#262930] rounded bg-[#131518]">
+                  <span className="text-[#8A909E] block">AVG SHARP</span>
+                  <span
+                    className={`font-semibold ${
+                      completedResult.avgSharpness >= 45 ? 'text-[#10B981]' : 'text-[#EF4444]'
+                    }`}
+                  >
+                    {completedResult.avgSharpness}
+                  </span>
+                </div>
+                <div className="p-1.5 border border-[#262930] rounded bg-[#131518]">
+                  <span className="text-[#8A909E] block">AVG TEXTURE</span>
+                  <span className="text-[#ECEEF2] font-semibold">{completedResult.avgTexture}%</span>
+                </div>
               </div>
-              <div className="bg-[#090b0e] p-2.5 rounded border border-[#1e2430]">
-                <span className="text-[#94a3b8] text-[10px] block">Format</span>
-                <span className="text-[#f1f5f9] font-medium truncate">{completedCapture.metadata.mimeType.split(';')[0]}</span>
+
+              {/* Primary Download Button */}
+              <button
+                onClick={handleDownload}
+                className="w-full py-2 rounded bg-[#ECEEF2] hover:bg-[#FFFFFF] text-[#0C0D0F] font-mono font-medium text-xs flex items-center justify-center gap-1.5 transition"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>DOWNLOAD .{completedResult.result.extension.toUpperCase()}</span>
+              </button>
+
+              {/* CLI Command Box */}
+              <div>
+                <div className="flex items-center justify-between text-[10px] text-[#8A909E] mb-1">
+                  <span>LOCAL LOOM CLI PIPELINE:</span>
+                  <button
+                    onClick={handleCopyCli}
+                    className="hover:text-[#ECEEF2] flex items-center gap-1 text-[#8A909E]"
+                  >
+                    {copiedCli ? <Check className="w-3 h-3 text-[#10B981]" /> : <Copy className="w-3 h-3" />}
+                    <span>{copiedCli ? 'COPIED' : 'COPY'}</span>
+                  </button>
+                </div>
+                <div className="p-2 border border-[#262930] bg-[#131518] rounded text-[10px] text-[#8A909E] font-mono break-all select-all">
+                  {cliCommand}
+                </div>
               </div>
             </div>
-
-            {/* Modal Actions */}
-            <div className="flex flex-col sm:flex-row gap-2.5 pt-2 border-t border-[#1e2430]">
-              <button
-                onClick={async () => {
-                  const bundle = loomBridge.prepareCaptureBundle(
-                    completedCapture.videoBlob,
-                    completedCapture.metadata
-                  );
-                  await loomBridge.submitReconstructionJob(bundle);
-                  setCompletedCapture(null);
-                  onOpenLoomBridge();
-                }}
-                className="flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg bg-[#00e599] hover:bg-[#00e599]/90 text-[#090b0e] font-bold text-xs transition"
-              >
-                <Sparkles className="w-4 h-4" />
-                <span>Submit to LOOM Pipeline</span>
-              </button>
-
-              <button
-                onClick={() => {
-                  loomBridge.downloadVideoFile(completedCapture.videoBlob, `loom_${completedCapture.metadata.id}.mp4`);
-                  loomBridge.downloadMetadataFile(completedCapture.metadata);
-                }}
-                className="flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg bg-[#090b0e] border border-[#1e2430] hover:border-[#00e599]/40 text-xs font-mono text-[#f1f5f9] transition"
-              >
-                <Download className="w-4 h-4 text-[#00e599]" />
-                <span>Save Files</span>
-              </button>
-
-              <button
-                onClick={() => setCompletedCapture(null)}
-                className="py-2.5 px-4 rounded-lg bg-[#181e2b] border border-[#1e2430] text-xs font-mono text-[#94a3b8] hover:text-[#f1f5f9] transition"
-              >
-                Close
-              </button>
-            </div>
-          </div>
+          )}
         </div>
-      )}
+      </div>
     </div>
   );
 };
