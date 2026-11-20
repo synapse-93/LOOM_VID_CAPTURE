@@ -1,21 +1,77 @@
-import React, { useState, useEffect } from 'react';
-import { QrCode, Check, Copy, X } from 'lucide-react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import {
+  QrCode,
+  Copy,
+  Check,
+  X,
+  Cpu,
+  Loader2,
+  FileVideo,
+  Layers,
+  Box,
+  Camera,
+} from 'lucide-react';
 import QRCode from 'qrcode';
-import { CaptureStudio } from './components/CaptureStudio';
-import { StlInspector } from './components/StlInspector';
-import { PipelineSpec } from './components/PipelineSpec';
+import {
+  ScanProject,
+  ensurePreSeeded,
+  saveProject,
+  deleteProject,
+} from './lib/projectStore';
+import { backgroundRunner } from './lib/backgroundRunner';
+import { FrameTelemetry } from './lib/cvGuidance';
+import { HistorySidebar } from './components/HistorySidebar';
+import { CaptureViewport } from './components/CaptureViewport';
+import { UploadViewport } from './components/UploadViewport';
+import { PipelineViewport } from './components/PipelineViewport';
+import { CadViewer3D } from './components/CadViewer3D';
+import { InspectorRail } from './components/InspectorRail';
+import { PipelineDrawer } from './components/PipelineDrawer';
 
-export type ActiveTab = 'capture' | 'inspector' | 'spec';
+export type WorkstationMode = 'CAMERA' | 'UPLOAD' | 'PIPELINE' | '3D VIEWER';
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<ActiveTab>('capture');
+  const [mode, setMode] = useState<WorkstationMode>('3D VIEWER');
+  const [projects, setProjects] = useState<ScanProject[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
 
-  // Mobile QR Modal State
+  // Background Runner Active Job state
+  const [activeJob, setActiveJob] = useState<{ id: string; stageName: string; percent: number } | null>(null);
+
+  // Live Telemetry from Camera
+  const [liveTelemetry, setLiveTelemetry] = useState<FrameTelemetry | null>(null);
+  const [orbitSectors, setOrbitSectors] = useState<number>(0);
+
+  // Drawers & Modals
+  const [isSpecDrawerOpen, setIsSpecDrawerOpen] = useState(false);
   const [isQrModalOpen, setIsQrModalOpen] = useState(false);
   const [qrDataUrl, setQrDataUrl] = useState('');
   const [currentUrl, setCurrentUrl] = useState('');
-  const [copied, setCopied] = useState(false);
+  const [copiedUrl, setCopiedUrl] = useState(false);
 
+  // 1. Initialize IndexedDB & Pre-Seeded Projects
+  const loadDatabase = useCallback(async () => {
+    try {
+      const seeded = await ensurePreSeeded();
+      setProjects(seeded);
+      if (seeded.length > 0 && !selectedProjectId) {
+        setSelectedProjectId(seeded[0].id);
+      }
+    } catch (err) {
+      console.error('[App] Database init error:', err);
+    }
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    loadDatabase();
+  }, [loadDatabase]);
+
+  // Selected Project instance
+  const selectedProject = useMemo(() => {
+    return projects.find((p) => p.id === selectedProjectId) || (projects.length > 0 ? projects[0] : null);
+  }, [projects, selectedProjectId]);
+
+  // 2. Mobile QR Code generation
   useEffect(() => {
     if (typeof window !== 'undefined') {
       const url = window.location.href;
@@ -34,82 +90,295 @@ export const App: React.FC = () => {
     }
   }, [isQrModalOpen]);
 
+  // Copy current URL
   const handleCopyUrl = () => {
     navigator.clipboard.writeText(currentUrl);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    setCopiedUrl(true);
+    setTimeout(() => setCopiedUrl(false), 2000);
+  };
+
+  // 3. Handle Completed Camera Capture
+  const handleCaptureComplete = async (result: {
+    blob: Blob;
+    mimeType: string;
+    extension: 'mp4' | 'webm';
+    sizeBytes: number;
+    durationSec: number;
+  }) => {
+    const now = Date.now();
+    const newProject: ScanProject = {
+      id: `proj-cam-${now}`,
+      name: `Capture_Orbit_${new Date(now).toISOString().slice(11, 19).replace(/:/g, '')}.${result.extension}`,
+      createdAt: now,
+      sourceType: 'CAMERA',
+      status: 'QUEUED',
+      durationSec: result.durationSec,
+      fileSize: result.sizeBytes,
+      videoBlob: result.blob,
+      progressPercent: 0,
+      logs: [
+        {
+          timestamp: '00:00:00.000',
+          stage: 'CAMERA_INGEST',
+          message: `Recorded ${result.durationSec.toFixed(1)}s 360° orbit capture (${(result.sizeBytes / (1024 * 1024)).toFixed(1)} MB ${result.mimeType})`,
+          level: 'success',
+        },
+      ],
+    };
+
+    await saveProject(newProject);
+    setProjects((prev) => [newProject, ...prev]);
+    setSelectedProjectId(newProject.id);
+    setMode('PIPELINE');
+
+    // Launch Background 8-Stage Reconstruction
+    startBackgroundPipeline(newProject);
+  };
+
+  // 4. Handle Uploaded Video
+  const handleVideoUploaded = async (file: File) => {
+    const now = Date.now();
+    const newProject: ScanProject = {
+      id: `proj-vid-${now}`,
+      name: file.name,
+      createdAt: now,
+      sourceType: 'UPLOAD',
+      status: 'QUEUED',
+      fileSize: file.size,
+      progressPercent: 0,
+      logs: [
+        {
+          timestamp: '00:00:00.000',
+          stage: 'FILE_INGEST',
+          message: `Uploaded local video file: ${file.name} (${(file.size / (1024 * 1024)).toFixed(1)} MB)`,
+          level: 'info',
+        },
+      ],
+    };
+
+    await saveProject(newProject);
+    setProjects((prev) => [newProject, ...prev]);
+    setSelectedProjectId(newProject.id);
+    setMode('PIPELINE');
+
+    // Launch Background 8-Stage Reconstruction
+    startBackgroundPipeline(newProject);
+  };
+
+  // 5. Handle Uploaded CAD project (.mlp / .stl / .ply / .obj)
+  const handleCadProjectLoaded = (project: ScanProject) => {
+    setProjects((prev) => {
+      const filtered = prev.filter((p) => p.id !== project.id);
+      return [project, ...filtered];
+    });
+    setSelectedProjectId(project.id);
+    setMode('3D VIEWER');
+  };
+
+  // 6. Execute Background Reconstruction Job
+  const startBackgroundPipeline = (project: ScanProject) => {
+    setActiveJob({ id: project.id, stageName: 'KEYFRAME_SELECTION', percent: 0 });
+
+    const unsubscribe = backgroundRunner.subscribe(project.id, (updated) => {
+      setProjects((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+      setActiveJob({
+        id: updated.id,
+        stageName: updated.currentStageName || 'PROCESSING',
+        percent: updated.progressPercent || 0,
+      });
+
+      if (updated.status === 'COMPLETED' || updated.status === 'FAILED') {
+        setActiveJob(null);
+        unsubscribe();
+      }
+    });
+
+    backgroundRunner.startJob(project);
+  };
+
+  // 7. Delete Project
+  const handleDeleteProject = async (projectId: string) => {
+    await deleteProject(projectId);
+    setProjects((prev) => {
+      const remaining = prev.filter((p) => p.id !== projectId);
+      if (selectedProjectId === projectId) {
+        setSelectedProjectId(remaining.length > 0 ? remaining[0].id : null);
+      }
+      return remaining;
+    });
   };
 
   return (
     <div className="min-h-screen bg-[#0C0D0F] text-[#ECEEF2] flex flex-col font-sans select-none overflow-hidden">
-      {/* 48px Precision Industrial Top Header Bar */}
-      <header className="h-[48px] bg-[#131518] border-b border-[#262930] px-4 flex items-center justify-between z-30">
+      {/* 44px Precision Industrial Top Header Bar */}
+      <header className="h-[44px] bg-[#131518] border-b border-[#262930] px-4 flex items-center justify-between z-30 shrink-0">
         {/* Left: Brand Identification */}
         <div className="flex items-center">
-          <span className="font-mono font-medium tracking-widest text-sm text-[#ECEEF2]">
+          <span className="font-mono font-bold tracking-widest text-xs text-[#ECEEF2]">
             LOOM
           </span>
           <span className="text-[#8A909E] mx-1.5 font-mono text-xs">/</span>
-          <span className="font-mono text-xs text-[#8A909E]">VID_CAPTURE</span>
+          <span className="font-mono text-xs text-[#8A909E]">WORKSTATION</span>
         </div>
 
-        {/* Center: Segmented Navigation Tab Bar */}
+        {/* Center: 4-Mode Workstation Segmented Switcher */}
         <nav className="border border-[#262930] rounded bg-[#0C0D0F] p-0.5 flex items-center gap-0.5 font-mono text-xs">
           <button
-            onClick={() => setActiveTab('capture')}
-            className={`px-3 py-1 rounded transition ${
-              activeTab === 'capture'
+            onClick={() => setMode('CAMERA')}
+            className={`px-3 py-1 rounded transition flex items-center gap-1.5 ${
+              mode === 'CAMERA'
                 ? 'bg-[#1A1D21] text-[#ECEEF2] border border-[#262930] font-medium'
                 : 'text-[#8A909E] hover:text-[#ECEEF2]'
             }`}
           >
-            01 CAPTURE STUDIO
+            <Camera className="w-3.5 h-3.5" />
+            <span>01 CAMERA</span>
           </button>
+
           <button
-            onClick={() => setActiveTab('inspector')}
-            className={`px-3 py-1 rounded transition ${
-              activeTab === 'inspector'
+            onClick={() => setMode('UPLOAD')}
+            className={`px-3 py-1 rounded transition flex items-center gap-1.5 ${
+              mode === 'UPLOAD'
                 ? 'bg-[#1A1D21] text-[#ECEEF2] border border-[#262930] font-medium'
                 : 'text-[#8A909E] hover:text-[#ECEEF2]'
             }`}
           >
-            02 STL INSPECTOR
+            <FileVideo className="w-3.5 h-3.5" />
+            <span>02 UPLOAD</span>
           </button>
+
           <button
-            onClick={() => setActiveTab('spec')}
-            className={`px-3 py-1 rounded transition ${
-              activeTab === 'spec'
+            onClick={() => setMode('PIPELINE')}
+            className={`px-3 py-1 rounded transition flex items-center gap-1.5 ${
+              mode === 'PIPELINE'
                 ? 'bg-[#1A1D21] text-[#ECEEF2] border border-[#262930] font-medium'
                 : 'text-[#8A909E] hover:text-[#ECEEF2]'
             }`}
           >
-            03 PIPELINE SPEC
+            <Cpu className="w-3.5 h-3.5" />
+            <span>03 PIPELINE</span>
+          </button>
+
+          <button
+            onClick={() => setMode('3D VIEWER')}
+            className={`px-3 py-1 rounded transition flex items-center gap-1.5 ${
+              mode === '3D VIEWER'
+                ? 'bg-[#1A1D21] text-[#ECEEF2] border border-[#262930] font-medium'
+                : 'text-[#8A909E] hover:text-[#ECEEF2]'
+            }`}
+          >
+            <Box className="w-3.5 h-3.5" />
+            <span>04 3D VIEWER</span>
           </button>
         </nav>
 
-        {/* Right: Mobile QR & Status Pill */}
+        {/* Right: Active Job Indicator & Spec / QR Buttons */}
         <div className="flex items-center gap-2">
+          {/* Background Running Job Status Pill */}
+          {activeJob && (
+            <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-[#10B981]/10 border border-[#10B981]/40 text-[#10B981] font-mono text-[11px]">
+              <Loader2 className="w-3 h-3 animate-spin" />
+              <span className="font-semibold uppercase truncate max-w-[140px]">
+                {activeJob.stageName}
+              </span>
+              <span className="tabular-nums">({activeJob.percent}%)</span>
+            </div>
+          )}
+
+          {/* Pipeline Spec Slide-Over Button */}
+          <button
+            onClick={() => setIsSpecDrawerOpen(true)}
+            className="border border-[#262930] rounded px-2.5 py-1 font-mono text-xs text-[#8A909E] hover:text-[#ECEEF2] hover:bg-[#1A1D21] transition flex items-center gap-1"
+            title="Open LOOM 8-Stage Architecture Spec"
+          >
+            <Layers className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">PIPELINE SPEC</span>
+          </button>
+
+          {/* Phone QR Button */}
           <button
             onClick={() => setIsQrModalOpen(true)}
             className="border border-[#262930] rounded px-2.5 py-1 font-mono text-xs text-[#ECEEF2] hover:bg-[#1A1D21] transition flex items-center gap-1.5"
             title="Open on Smartphone Camera via QR"
           >
             <QrCode className="w-3.5 h-3.5 text-[#8A909E]" />
-            <span className="hidden sm:inline">MOBILE QR</span>
+            <span className="hidden sm:inline">PHONE QR</span>
           </button>
-
-          <span className="font-mono text-[11px] text-[#8A909E] px-2 py-0.5 border border-[#262930] rounded bg-[#0C0D0F]">
-            MODE: STANDALONE
-          </span>
         </div>
       </header>
 
-      {/* Main Workstation View Area */}
-      <main className="flex-1 relative overflow-hidden bg-[#0C0D0F]">
-        {activeTab === 'capture' && <CaptureStudio />}
-        {activeTab === 'inspector' && <StlInspector />}
-        {activeTab === 'spec' && <PipelineSpec />}
-      </main>
+      {/* Main Unified 3-Pane Workstation Layout */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* Pane 1 (Left 260px): Project History & Queue Dock */}
+        <HistorySidebar
+          projects={projects}
+          selectedProjectId={selectedProjectId}
+          onSelectProject={(proj) => {
+            setSelectedProjectId(proj.id);
+            if (proj.status === 'RUNNING' || proj.status === 'QUEUED') {
+              setMode('PIPELINE');
+            } else if (proj.status === 'COMPLETED' || proj.status === 'NEEDS_MESH') {
+              setMode('3D VIEWER');
+            }
+          }}
+          onDeleteProject={handleDeleteProject}
+          onNewCapture={() => setMode('CAMERA')}
+          onOpenUpload={() => setMode('UPLOAD')}
+        />
+
+        {/* Pane 2 (Center Viewport): Primary Mode Canvas */}
+        <main className="flex-1 relative overflow-hidden bg-[#0C0D0F]">
+          {mode === 'CAMERA' && (
+            <CaptureViewport
+              onCaptureComplete={handleCaptureComplete}
+              onSwitchToUpload={() => setMode('UPLOAD')}
+              onTelemetryUpdate={(telem, sectors) => {
+                setLiveTelemetry(telem);
+                setOrbitSectors(sectors);
+              }}
+            />
+          )}
+
+          {mode === 'UPLOAD' && (
+            <UploadViewport
+              onVideoUploaded={handleVideoUploaded}
+              onCadProjectLoaded={handleCadProjectLoaded}
+            />
+          )}
+
+          {mode === 'PIPELINE' && (
+            <PipelineViewport
+              project={selectedProject}
+              onOpen3DViewer={() => setMode('3D VIEWER')}
+              onCancelJob={(id) => backgroundRunner.cancel(id)}
+            />
+          )}
+
+          {mode === '3D VIEWER' && (
+            <CadViewer3D
+              project={selectedProject}
+              onProjectUpdated={(updated) => {
+                setProjects((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+              }}
+              onOpenUpload={() => setMode('UPLOAD')}
+            />
+          )}
+        </main>
+
+        {/* Pane 3 (Right 300px): Contextual Inspector Rail */}
+        <InspectorRail
+          mode={mode}
+          project={selectedProject}
+          liveTelemetry={liveTelemetry}
+          orbitSectors={orbitSectors}
+        />
+      </div>
+
+      {/* Slide-Over Pipeline Architecture Spec Drawer */}
+      <PipelineDrawer
+        isOpen={isSpecDrawerOpen}
+        onClose={() => setIsSpecDrawerOpen(false)}
+      />
 
       {/* High-Contrast Industrial QR Code Modal */}
       {isQrModalOpen && (
@@ -148,10 +417,10 @@ export const App: React.FC = () => {
               </span>
               <button
                 onClick={handleCopyUrl}
-                className="px-2.5 py-1 rounded bg-[#1A1D21] hover:bg-[#262930] text-[10px] text-[#ECEEF2] transition flex items-center gap-1"
+                className="px-2 py-1 rounded bg-[#1A1D21] hover:bg-[#262930] text-[#ECEEF2] text-[10px] transition flex items-center gap-1"
               >
-                {copied ? <Check className="w-3 h-3 text-[#10B981]" /> : <Copy className="w-3 h-3" />}
-                <span>{copied ? 'COPIED' : 'COPY'}</span>
+                {copiedUrl ? <Check className="w-3 h-3 text-[#10B981]" /> : <Copy className="w-3 h-3" />}
+                {copiedUrl ? 'COPIED' : 'COPY'}
               </button>
             </div>
           </div>

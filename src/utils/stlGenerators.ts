@@ -95,7 +95,124 @@ export function createCalibrationPrismGeometry(): THREE.BufferGeometry {
   pin.translate(0, 7.5, 12);
   geometries.push(pin);
 
-  return mergeBufferGeometries(geometries);
+  const merged = mergeBufferGeometries(geometries);
+  alignGeometryToBaseplate(merged);
+  return merged;
+}
+
+/**
+ * Creates athletic shoe reference geometry with toe spring, heel counter,
+ * and outsole profile, scaled to exact target length (default 280mm, EU 43).
+ */
+export function createShoeModelGeometry(targetLengthMm = 280): THREE.BufferGeometry {
+  const geometries: THREE.BufferGeometry[] = [];
+
+  // 1. Outsole base plate (Z-axis length ~280mm, X-axis width ~100mm, Y-axis thickness ~14mm)
+  const sole = new THREE.BoxGeometry(94, 14, 270, 12, 2, 28);
+  sole.translate(0, 7, 0);
+  geometries.push(sole);
+
+  // 2. Midsole cushion layer (slightly tapered)
+  const midsole = new THREE.BoxGeometry(90, 20, 255, 10, 2, 24);
+  midsole.translate(0, 24, -5);
+  geometries.push(midsole);
+
+  // 3. Heel wedge / counter (heightens back of shoe)
+  const heelWedge = new THREE.CylinderGeometry(38, 42, 28, 24);
+  heelWedge.scale(1.1, 1, 1.4);
+  heelWedge.translate(0, 42, -75);
+  geometries.push(heelWedge);
+
+  // 4. Forefoot / Toe box with upward toe spring
+  const forefoot = new THREE.CylinderGeometry(40, 45, 22, 24);
+  forefoot.scale(1.05, 0.9, 1.5);
+  forefoot.translate(0, 32, 60);
+  geometries.push(forefoot);
+
+  // 5. Instep & Shoe Collar / Ankle opening
+  const collar = new THREE.TorusGeometry(32, 12, 16, 28);
+  collar.rotateX(Math.PI / 2);
+  collar.scale(0.85, 1.3, 1);
+  collar.translate(0, 68, -35);
+  geometries.push(collar);
+
+  // 6. Tongue and laces bridge
+  const tongue = new THREE.BoxGeometry(42, 12, 90);
+  tongue.rotateX(-0.35);
+  tongue.translate(0, 58, 15);
+  geometries.push(tongue);
+
+  const raw = mergeBufferGeometries(geometries);
+
+  // Scale along Z to exact targetLengthMm
+  scaleGeometryToTargetLength(raw, targetLengthMm, 'z');
+
+  // Align base flush to Y = 0.000 mm and center X/Z
+  alignGeometryToBaseplate(raw);
+
+  return raw;
+}
+
+/**
+ * Scales geometry so its bounding box dimension along chosen axis matches targetLengthMm.
+ */
+export function scaleGeometryToTargetLength(
+  geometry: THREE.BufferGeometry,
+  targetLengthMm: number,
+  axis: 'x' | 'y' | 'z' = 'z'
+): void {
+  geometry.computeBoundingBox();
+  const bbox = geometry.boundingBox!;
+  const currentDim = bbox.max[axis] - bbox.min[axis];
+  if (currentDim <= 0) return;
+
+  const scaleFactor = targetLengthMm / currentDim;
+  geometry.scale(scaleFactor, scaleFactor, scaleFactor);
+  geometry.computeVertexNormals();
+}
+
+/**
+ * Snaps base of geometry flush to Y = 0.000 mm and centers X and Z at origin.
+ */
+export function alignGeometryToBaseplate(geometry: THREE.BufferGeometry): void {
+  geometry.computeBoundingBox();
+  const bbox = geometry.boundingBox!;
+  const center = new THREE.Vector3();
+  bbox.getCenter(center);
+
+  geometry.translate(-center.x, -bbox.min.y, -center.z);
+  geometry.computeVertexNormals();
+}
+
+/**
+ * Extracts bounding metrics, triangle count, and volume in cm3.
+ */
+export function getGeometryMetrics(geometry: THREE.BufferGeometry): {
+  triangles: number;
+  dimensionsMm: [number, number, number];
+  volumeCm3: number;
+} {
+  geometry.computeBoundingBox();
+  const bbox = geometry.boundingBox || new THREE.Box3();
+  const size = new THREE.Vector3();
+  bbox.getSize(size);
+
+  const pos = geometry.getAttribute('position');
+  const triangles = geometry.index ? geometry.index.count / 3 : pos.count / 3;
+
+  // Approximate watertight volume from bounding volume * form factor
+  const boundingVolCm3 = (size.x * size.y * size.z) / 1000;
+  const estimatedVol = Math.round(boundingVolCm3 * 0.42 * 10) / 10;
+
+  return {
+    triangles: Math.round(triangles),
+    dimensionsMm: [
+      Math.round(size.x * 10) / 10,
+      Math.round(size.z * 10) / 10,
+      Math.round(size.y * 10) / 10,
+    ],
+    volumeCm3: Math.max(1, estimatedVol),
+  };
 }
 
 /**
